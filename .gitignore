@@ -1,0 +1,12 @@
+# Clasp specific (Hides your specific Script ID from the public)
+.clasp.json
+
+# Node.js (If you use any npm packages or local tools)
+node_modules/
+npm-debug.log*
+
+# Mac System Files
+.DS_Store
+
+# Credentials (In case you ever use a service account)
+creds.json
