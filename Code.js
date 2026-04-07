@@ -1,6 +1,7 @@
 // ================= CONFIG & GLOBALS =================
 const GITHUB_TOKEN = PropertiesService.getScriptProperties().getProperty("GITHUB_TOKEN");
-const DEBUG_LOGS = true;
+const DEBUG_LOGS = false;
+const VERBOSE_LOGS = false; // Set to true for deep JSON/Batch stringify logs
 
 const START_TIME = Date.now();
 const MAX_RUNTIME = 4.5 * 60 * 1000; // 4.5 Minutes max runtime to safely exit before hard Google limit
@@ -11,10 +12,23 @@ function shouldStop() {
   }
 }
 
-// email search query for crm csv
-const CRM_EMAIL_SEARCH_QUERY = 'subject:"Zoho CRM - Report Scheduler" has:attachment filename:csv';
+// email search query generator
+function buildCrmSearchQuery(fileIdentifier, strict = true) {
+  const baseQuery = `subject:"Zoho CRM - Report Scheduler" has:attachment`;
+  // Force strict filename matching to prevent pulling backups or similar reports
+  return strict 
+    ? `${baseQuery} newer_than:7d filename:${fileIdentifier}` 
+    : `${baseQuery} filename:${fileIdentifier}`;
+}
+
+const MAX_FILE_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 Days hard limit for file freshness
+let globalAmbiguousDateCount = 0;
+let globalUnknownHeaders = 0;
+let globalAliasCollisions = 0;
+let HEADER_CACHE = {}; // Sheet-level session cache
 
 const CONFIG = {
+  EXPECTED_DATE_FORMAT: "UK", // "UK" (DD/MM/YYYY) or "US" (MM/DD/YYYY)
   SHEETS: {
     TRACKER: "Student Tracker",
     CRM_RAW: "CRM Raw Data",
@@ -44,22 +58,23 @@ const FEATURES = {
   L3_MODULE_TRACKING: false,
   LMS_TRACKING: true,
   GITHUB_TRACKING: true,
-  RISK_ENGINE: true
+  RISK_ENGINE: true,
+  ALLOW_OVERWRITE_NON_MANUAL: true 
 };
 
 const COURSE_PRESETS = {
   L5: {
-    PROJECT_TRACKING: true,   // Turns ON P1-P5 deadlines
-    SPECIALISATION: true,     // Turns ON Specialisation logic
-    L3_MODULE_TRACKING: false,// Hides L3 manual modules
+    PROJECT_TRACKING: true,   
+    SPECIALISATION: true,     
+    L3_MODULE_TRACKING: false,
     LMS_TRACKING: true,
     GITHUB_TRACKING: true,
     RISK_ENGINE: true
   },
   L3: {
-    PROJECT_TRACKING: false,  // Turns OFF L5 project deadlines
-    SPECIALISATION: false,    // Turns OFF L5 specialisation logic
-    L3_MODULE_TRACKING: true, // Turns ON L3 manual module tracking (PI, OOP, etc.)
+    PROJECT_TRACKING: false,  
+    SPECIALISATION: false,    
+    L3_MODULE_TRACKING: true, 
     LMS_TRACKING: true,       
     GITHUB_TRACKING: true,    
     RISK_ENGINE: true         
@@ -73,6 +88,10 @@ function normId(id) {
   return String(id).trim().replace(/^zcrm_/, ''); 
 }
 const NEVER = "Never";
+function isNever(val) {
+  if (val === null || val === undefined) return false;
+  return String(val).trim().toLowerCase() === "never";
+}
 
 // Performance caching for commonly used headers
 const H = {
@@ -82,8 +101,8 @@ const H = {
   COURSE_CODE: normHeader("Course Of Interest Code"),
   PATHWAY: normHeader("Pathway"),
   PROJ_SUB: normHeader("Projects submitted"),
-  RISK_FLAG: normHeader("Risk Flag"),
-  RISK_REASON: normHeader("Risk Reason"),
+  AUTO_RISK_REASON: normHeader("Auto Risk Reason"),
+  RISK_NOTES: normHeader("Risk Notes"),
   LMS_ACT: normHeader("LMS Last Activity"),
   LMS_DAYS: normHeader("Days Since LMS Activity"),
   LMS_PROG: normHeader("Progress"),
@@ -95,6 +114,13 @@ const H = {
   DISC_ID: normHeader("discord user id"),
   P5_DEADLINE: normHeader("P5_submission_deadline"),
   SPEC_DEADLINE: normHeader("Specialization Selection Deadline")
+};
+
+const STRICT_HEADER_MAP = {
+  "record id": H.ID,
+  "email": H.EMAIL,
+  "full name": H.NAME,
+  "course of interest code": H.COURSE_CODE
 };
 
 // Globals to be initialized dynamically
@@ -110,17 +136,21 @@ function loadCourseType() {
   let courseType = props.getProperty("COURSE_TYPE");
   
   if (!fileIdentifier) {
-    const ui = SpreadsheetApp.getUi();
-    const response = ui.prompt(
-      "⚙️ Tracker Setup",
-      "What is the name of the CRM CSV report please?\n(e.g., 'L5_student_data_<name>')\nThis ensures the script fetches the correct csv file from your email.",
-      ui.ButtonSet.OK
-    );
-    
-    fileIdentifier = response.getResponseText().trim();
-    if (!fileIdentifier) {
-      ui.alert("⚠️ No name provided. Defaulting to search for 'student_data'. You can change this in the menu later.");
-      fileIdentifier = "student_data";
+    try {
+      const ui = SpreadsheetApp.getUi();
+      const response = ui.prompt(
+        "⚙️ Tracker Setup",
+        "Enter part of your CRM report filename.\n\nExample:\nL5_student_data\n\nThis is used to automatically find your report in Gmail.",
+        ui.ButtonSet.OK
+      );
+      
+      fileIdentifier = response.getResponseText().trim();
+      if (!fileIdentifier) {
+        ui.alert("⚠️ No name provided. Defaulting to search for 'student_data'. You can change this in the menu later.");
+        fileIdentifier = "student_data";
+      }
+    } catch (e) {
+      throw new Error("⚠️ Setup incomplete: CRM report name not configured. Please run 'Run Setup Check' from the Student Tracker menu to initialize.");
     }
     
     if (/L3/i.test(fileIdentifier)) {
@@ -145,7 +175,6 @@ function applyCoursePreset(courseType) {
   } else {
     Object.assign(FEATURES, preset);
   }
-  if (DEBUG_LOGS) console.log(`✅ Loaded Feature Preset: ${courseType}`);
 }
 
 function buildGlobals() {
@@ -172,7 +201,7 @@ function buildGlobals() {
   }
 
   // Set up Manual Columns
-  const manualSet = new Set(["Notes", "Risk Reason"].map(normHeader));
+  const manualSet = new Set(["Notes", "Risk Notes"].map(normHeader));
   if (FEATURES.L3_MODULE_TRACKING) {
     CONFIG.L3_MODULES.forEach(mod => {
       manualSet.add(normHeader(mod));
@@ -192,7 +221,7 @@ function buildGlobals() {
     ...COLUMN_OWNERS.LMS, 
     ...COLUMN_OWNERS.GITHUB, 
     ...COLUMN_OWNERS.MANUAL, 
-    H.RISK_FLAG
+    H.AUTO_RISK_REASON
   ]);
 }
 
@@ -213,43 +242,53 @@ function resolveAlias(norm) {
   return norm;
 }
 
+function getHeaderMap(sheetName, headersNorm, isTracker = false) {
+  if (Object.keys(HEADER_CACHE).length > 50) HEADER_CACHE = {}; 
+  const rawHash = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, JSON.stringify(headersNorm));
+  const txtHash = rawHash.map(b => (b < 0 ? b + 256 : b).toString(16).padStart(2, '0')).join('');
+  const key = sheetName + "_" + isTracker + "_" + headersNorm.length + "_" + txtHash;
+  
+  if (!HEADER_CACHE[key]) {
+    HEADER_CACHE[key] = buildHeaderMap(headersNorm, isTracker);
+  }
+  return HEADER_CACHE[key];
+}
+
 function buildHeaderMap(headers, isTracker = false) {
   const map = {};
   const CRITICAL_ALIASES = new Set([H.ID, H.EMAIL]); 
   
   headers.forEach((h, i) => {
     let norm = normHeader(h);
-    norm = resolveAlias(norm);
+    
+    // Strict schema mapping first for reliability
+    if (!isTracker && STRICT_HEADER_MAP[norm]) {
+        norm = STRICT_HEADER_MAP[norm];
+    } else {
+        norm = resolveAlias(norm); // Fuzzy fallback
+    }
+
     if (norm) {
       if (isTracker && map[norm] !== undefined) {
         if (CRITICAL_ALIASES.has(norm)) {
            throw new Error(`❌ FATAL ALIAS COLLISION: Multiple columns mapped to critical field "${norm}". Fix sheet headers to prevent data corruption.`);
-        } else if (DEBUG_LOGS) {
-           console.warn(`⚠️ Alias collision detected in Tracker: "${norm}" mapped to col ${map[norm]}, now overwriting with col ${i}.`);
+        } else {
+           globalAliasCollisions++;
+           if (DEBUG_LOGS) console.warn(`⚠️ Alias collision detected in Tracker: "${norm}" mapped to col ${map[norm]}, skipping col ${i}.`);
+           return; 
         }
       }
       map[norm] = i;
       if (isTracker && DEBUG_LOGS && !ALL_KNOWN_HEADERS.has(norm) && !_loggedUnknowns.has(norm)) {
-        console.log(`⚠️ Schema Drift Alert: Unknown header detected in Tracker -> "${norm}" (Original text: "${h}")`);
+        globalUnknownHeaders++;
+        if (_loggedUnknowns.size > 200) return; 
+        console.warn(`⚠️ Schema Drift Alert: Unknown header detected in Tracker -> "${norm}"`);
         _loggedUnknowns.add(norm);
       }
     }
   });
 
-  if (isTracker && !FEATURES.PROJECT_TRACKING && map[H.P5_DEADLINE] !== undefined) {
-    console.warn("⚠️ Project columns detected in tracker but PROJECT_TRACKING feature is OFF");
-  }
-
   return map;
-}
-
-function stableRow(row) {
-  if (!row || !Array.isArray(row)) return [];
-  return row.map(v => {
-    if (v instanceof Date) return Utilities.formatDate(v, "UTC", "yyyy-MM-dd");
-    if (typeof v === "string") return v.trim();
-    return v;
-  });
 }
 
 function normalizeForComparison(v) {
@@ -257,6 +296,12 @@ function normalizeForComparison(v) {
   if (v instanceof Date) return `DATE:${v.getTime()}`;
   if (typeof v === "number") return `NUM:${v}`;
   if (typeof v === "boolean") return `BOOL:${v}`;
+  if (typeof v === "object") {
+     const sortedKeys = Object.keys(v).sort();
+     const sortedObj = {};
+     for(let k of sortedKeys) sortedObj[k] = v[k];
+     return `OBJ:${JSON.stringify(sortedObj)}`;
+  }
   const str = String(v).trim().toLowerCase(); 
   if (str.startsWith("=")) return `FORMULA:${str.replace(/\s+/g, "")}`;
   return `STR:${str}`;
@@ -268,7 +313,25 @@ function isDifferent(a, b) {
 
 function fastHash(row) {
   if (!row || !Array.isArray(row)) return "";
-  return row.map(normalizeForComparison).join("|");
+  let hash = "";
+  for (let i = 0; i < row.length; i++) {
+    let v = row[i];
+    if (v instanceof Date) hash += i + ":D:" + v.getTime() + "|";
+    else if (typeof v === "number") hash += i + ":N:" + v + "|";
+    else if (typeof v === "boolean") hash += i + ":B:" + v + "|";
+    else if (v === null || v === undefined || v === "") hash += i + ":|";
+    else if (typeof v === "object") {
+        const sortedKeys = Object.keys(v).sort();
+        const sortedObj = {};
+        for(let k of sortedKeys) sortedObj[k] = v[k];
+        hash += i + ":O:" + JSON.stringify(sortedObj) + "|";
+    }
+    else {
+      const str = String(v).trim().toLowerCase();
+      hash += i + ":" + (str.startsWith("=") ? "F:" + str.replace(/\s+/g, "") : "S:" + str) + "|";
+    }
+  }
+  return hash;
 }
 
 function logDiff(origRow, newRow, headerMap, identifier) {
@@ -283,27 +346,41 @@ function logDiff(origRow, newRow, headerMap, identifier) {
   if (diffs.length > 0) { console.log(`🔄 UPDATED [${identifier}]:\n  ` + diffs.join("\n  ")); }
 }
 
+function enforceCacheLimit(cacheObj, limit) {
+  const keys = Object.keys(cacheObj);
+  if (keys.length > limit) {
+    const overflow = keys.length - limit;
+    const keysToRemove = Object.entries(cacheObj).sort((a,b) => (a[1]?.ts || 0) - (b[1]?.ts || 0)).slice(0, overflow).map(e => e[0]);
+    keysToRemove.forEach(k => delete cacheObj[k]);
+  }
+}
+
 // ================= ROW MODEL =================
 function createRowModel(row, headerMap, readOnlyFields = new Set()) {
   return {
     get(field) {
       const idx = headerMap[field];
-      return (idx !== undefined && idx !== -1) ? row[idx] : undefined;
+      return idx !== undefined ? row[idx] : undefined;
     },
     set(field, value) {
-      // blocks automated overwrites of protected manual fields
       if (readOnlyFields.has(field)) {
-         if (DEBUG_LOGS) console.warn(`🛡️ BLOCKED: Attempted to overwrite protected manual field: ${field}`);
          return; 
       }
       const idx = headerMap[field];
-      if (idx !== undefined && idx !== -1) {
+      if (idx !== undefined) {
+        if (typeof row[idx] === "string" && row[idx].startsWith("=") && !(typeof value === "string" && value.startsWith("="))) {
+           return;
+        }
         row[idx] = value;
       }
     },
+    safeSet(field, value) {
+      if (isDifferent(this.get(field), value)) {
+        this.set(field, value);
+      }
+    },
     has(field) {
-      const idx = headerMap[field];
-      return idx !== undefined && idx !== -1;
+      return headerMap[field] !== undefined;
     },
     colIndex(field) {
       return headerMap[field];
@@ -317,15 +394,25 @@ function createRowModel(row, headerMap, readOnlyFields = new Set()) {
 let _dateCache = new Map();
 
 function parseRobustDate(rawDate) {
-  if (!rawDate) return null;
+  if (rawDate === null || rawDate === undefined) return null;
   if (rawDate instanceof Date) return rawDate;
+  
   const str = String(rawDate).trim();
-  if (str === "" || str.toLowerCase() === "never" || str === NEVER || str.toLowerCase() === "null") return NEVER; 
-  if (_dateCache.has(str)) return _dateCache.get(str);
-  if (_dateCache.size > 1000) {
-    const firstKey = _dateCache.keys().next().value;
-    _dateCache.delete(firstKey);
+  if (str === "" || str.toLowerCase() === "null") return null; 
+  if (isNever(str)) return NEVER; 
+  
+  if (_dateCache.has(str)) {
+    const cached = _dateCache.get(str);
+    _dateCache.delete(str);
+    _dateCache.set(str, cached); // True LRU bump
+    return cached;
   }
+  
+  if (_dateCache.size > 1000) {
+    const keys = _dateCache.keys();
+    for (let i = 0; i < 200; i++) _dateCache.delete(keys.next().value);
+  }
+  
   let parsedDate = null;
   if (str.includes('T')) {
     const d = new Date(str);
@@ -347,37 +434,96 @@ function parseRobustDate(rawDate) {
         const p3 = parseInt(dParts[2], 10);
         if (p1 > 1000) { y = p1; m = p2; d = p3; } 
         else {
-          if (p1 > 12 && p2 <= 12) { d = p1; m = p2; y = p3; } // UK Format
-          else if (p2 > 12 && p1 <= 12) { m = p1; d = p2; y = p3; } // US Format
-          else { d = p1; m = p2; y = p3; } // Ambiguous defaults to UK
+          y = p3;
+          if (p1 > 12 && p2 <= 12) { d = p1; m = p2; } 
+          else if (p2 > 12 && p1 <= 12) { m = p1; d = p2; } 
+          else { 
+              if (CONFIG.EXPECTED_DATE_FORMAT === "US") { m = p1; d = p2; } 
+              else { d = p1; m = p2; }
+              globalAmbiguousDateCount++;
+          } 
         }
         if (d && m && y) parsedDate = new Date(y, m - 1, d, th, tm, ts);
       }
     }
   }
-  if (!parsedDate || isNaN(parsedDate.getTime())) return "INVALID_DATE";
+  
+  if (!parsedDate || isNaN(parsedDate.getTime())) {
+      if (DEBUG_LOGS && VERBOSE_LOGS) console.warn(`⚠️ Invalid date encountered: '${str}'`);
+      return null;
+  }
   _dateCache.set(str, parsedDate);
   return parsedDate;
 }
 
 function calculateDaysSince(dateVal) {
-  if (!dateVal || dateVal === "" || dateVal === NEVER || dateVal === "INVALID_DATE") return null; 
+  if (!dateVal || dateVal === "" || isNever(dateVal) || dateVal === "INVALID_DATE") return null; 
   let d = parseRobustDate(dateVal); 
   if (!(d instanceof Date) || isNaN(d.getTime())) return null;
   const today = new Date(); today.setHours(0,0,0,0);
   const past = new Date(d); past.setHours(0,0,0,0);
   const days = Math.floor((today - past) / (1000 * 60 * 60 * 24));
-  if (days < 0) return "Future Date"; 
+  if (days < 0) return null; 
   return days;
 }
 
-// ================= TRANSACTION MANAGER =================
+// ================= PREFLIGHT & TRANSACTION MANAGER =================
+
+function runPreflightChecks(isSetupCheck = false) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const props = PropertiesService.getDocumentProperties();
+
+  const fileId = props.getProperty("CRM_FILE_IDENTIFIER");
+  if (!fileId) {
+    throw new Error("⚠️ Setup incomplete:\n\nCRM report name not configured.\n\nGo to:\nStudent Tracker → ⚙️ Change CRM Report Name");
+  }
+
+  const threads = GmailApp.search(buildCrmSearchQuery(fileId, true), 0, 1);
+
+  if (!threads.length) {
+    throw new Error(`⚠️ No CRM emails found from the last 7 days.\n\nLooking for CSV attachment containing:\n"${fileId}"\n\nFix:\n• Check your inbox\n• Or update report name via the menu`);
+  }
+
+  const tracker = ss.getSheetByName(CONFIG.SHEETS.TRACKER);
+  if (!tracker) {
+    if (isSetupCheck) throw new Error("⚠️ Tracker sheet missing.\n\nRun a Full Sync once to generate the structure.");
+    return true; 
+  }
+
+  if (tracker.getLastRow() === 0 || tracker.getLastColumn() === 0) {
+    if (isSetupCheck) throw new Error("⚠️ Tracker not initialised.\n\nRun a Full Sync once to generate the structure.");
+    return true; 
+  }
+
+  const headers = tracker.getRange(1, 1, 1, tracker.getLastColumn()).getValues()[0].map(normHeader);
+
+  if (!headers.includes(H.EMAIL) || !headers.includes(H.ID)) {
+    throw new Error("❌ Critical columns missing (Email / Record Id).\n\nDo not rename or delete core headers.");
+  }
+
+  return true;
+}
+
 function checkCrashLock() {
-  const lockData = PropertiesService.getScriptProperties().getProperty("SYNC_TRANSACTION_ACTIVE");
-  if (lockData) {
-    const info = JSON.parse(lockData);
+  const props = PropertiesService.getScriptProperties();
+  const lockStr = props.getProperty("SYNC_TRANSACTION_ACTIVE");
+  if (lockStr) {
+    const info = JSON.parse(lockStr);
+    const TEN_MINUTES = 10 * 60 * 1000;
+    if (Date.now() - new Date(info.startedAt).getTime() > TEN_MINUTES) {
+        if (DEBUG_LOGS) console.warn("⚠️ Cleared stale crash lock from a previous timed-out execution.");
+        props.deleteProperty("SYNC_TRANSACTION_ACTIVE");
+        return;
+    }
     throw new Error(`❌ CRITICAL: Previous sync crashed during the [${info.stage}] Write/Delete phase at ${info.startedAt}. Manual inspection of the Tracker is required to clear partial duplicates. Clear the crash lock from the custom menu when safe to proceed.`);
   }
+}
+
+function verifySyncContext() {
+   const props = PropertiesService.getScriptProperties();
+   if (!props.getProperty("ACTIVE_SYNC_CONTEXT")) {
+       throw new Error("❌ CRITICAL: Module executed outside of a secure sync context. Aborting to prevent data corruption.");
+   }
 }
 
 function executeSecureWrite(stageName, writeAction) {
@@ -392,36 +538,42 @@ function executeSecureWrite(stageName, writeAction) {
 
 // ================= MODULAR RISK ENGINE =================
 function applyRiskEngine() {
+  verifySyncContext();
   if (!FEATURES.RISK_ENGINE) return { redCount: 0, aborted: false };
 
   const trackerSheet = getOrCreateSheet(CONFIG.SHEETS.TRACKER);
   const data = getSheetDataWithFormulas(trackerSheet);
   if (data.length <= 1) return { redCount: 0, aborted: false };
   
-  const hRow = data[0].map(normHeader);
-  let flagColIdx = hRow.indexOf(H.RISK_FLAG);
-  let reasonColIdx = hRow.indexOf(H.RISK_REASON);
+  let hRow = data[0].map(normHeader);
+  let autoReasonColIdx = hRow.indexOf(H.AUTO_RISK_REASON);
+  let notesColIdx = hRow.indexOf(H.RISK_NOTES);
   
   let headersModified = false;
   let currentCols = data[0].length;
   
-  if (flagColIdx === -1) {
-    flagColIdx = currentCols++;
-    data[0].push("Risk Flag");
+  if (autoReasonColIdx === -1) {
+    autoReasonColIdx = currentCols++;
+    data[0].push("Auto Risk Reason");
     for (let i = 1; i < data.length; i++) data[i].push("");
     headersModified = true;
   }
-  if (reasonColIdx === -1) {
-    reasonColIdx = currentCols++;
-    data[0].push("Risk Reason");
+  if (notesColIdx === -1) {
+    notesColIdx = currentCols++;
+    data[0].push("Risk Notes");
     for (let i = 1; i < data.length; i++) data[i].push("");
     headersModified = true;
   }
   
+  let headerMap = getHeaderMap(CONFIG.SHEETS.TRACKER, hRow, true); 
+
   if (headersModified) {
     const maxCols = trackerSheet.getMaxColumns();
     if (maxCols < currentCols) trackerSheet.insertColumnsAfter(maxCols, currentCols - maxCols);
     trackerSheet.getRange(1, 1, 1, currentCols).setValues([data[0]]).setFontWeight("bold");
+    
+    hRow = data[0].map(normHeader);
+    headerMap = getHeaderMap(CONFIG.SHEETS.TRACKER, hRow, true);
   }
   
   const headers = data[0];
@@ -433,8 +585,14 @@ function applyRiskEngine() {
   let anyChange = false;
   let processedRows = 0; 
   
-  const headerMap = buildHeaderMap(hRow, true); 
   const nextData = data.map(r => r.slice());
+  let rowsToWrite = [];
+  
+  const manualColIndexes = [];
+  COLUMN_OWNERS.MANUAL.forEach(field => {
+      const idx = headerMap[field];
+      if (idx !== undefined) manualColIndexes.push(idx);
+  });
 
   for (let i = 1; i < nextData.length; i++) {
     shouldStop();
@@ -446,18 +604,35 @@ function applyRiskEngine() {
     const origRowCopy = student.raw.slice();
     const origBgCopy = workingBgRow.slice();
     
-    const { isRed, flags } = evaluateRowRisk(student, workingBgRow);
+    const origHash = fastHash(origRowCopy);
+    const origBgHash = fastHash(origBgCopy);
+    
+    const { isRed, totalRisk, flags } = evaluateRowRisk(student, workingBgRow);
     const flagsText = flags.length ? [...new Set(flags.map(f => f.trim()))].join(" | ") : "";
     
-    if (isDifferent(student.get(H.RISK_FLAG), flagsText)) { student.set(H.RISK_FLAG, flagsText); }
+    student.safeSet(H.AUTO_RISK_REASON, flagsText);
+    
     if (isRed) redCount++;
     
-    const valChanged = fastHash(origRowCopy) !== fastHash(student.raw);
-    const bgChanged = fastHash(origBgCopy) !== fastHash(workingBgRow);
+    const newHash = fastHash(student.raw);
+    const newBgHash = fastHash(workingBgRow);
+    
+    const valChanged = origHash !== newHash;
+    const bgChanged = origBgHash !== newBgHash;
     
     if (valChanged || bgChanged) {
        anyChange = true;
        forceWriteRows.add(i);
+       const sheetRow = i + 1;
+       const safeBg = workingBgRow;
+       
+       if (valChanged && bgChanged) {
+           rowsToWrite.push({ row: sheetRow, values: nextData[i].slice(), bg: safeBg });
+       } else if (valChanged) {
+           rowsToWrite.push({ row: sheetRow, values: nextData[i].slice(), bg: null });
+       } else if (bgChanged) {
+           rowsToWrite.push({ row: sheetRow, values: null, bg: safeBg });
+       }
        if (bgChanged) bg[i-1] = workingBgRow.slice();
     }
   }
@@ -466,26 +641,13 @@ function applyRiskEngine() {
     throw new Error("❌ CRITICAL: No Risk Engine rows successfully processed. Aborting to prevent blank overwrite.");
   }
   
-  if (!anyChange && forceWriteRows.size === 0 && processedRows > 0) {
-    if (DEBUG_LOGS) {
-      console.log("✅ No changes detected in Risk Engine. (Normal if tracking data is stable)");
-      console.log(JSON.stringify({ module: "RISK_ENGINE", processedRows, forceWriteRows: forceWriteRows.size, reason: "no_diff_detected" }));
-    }
+  if (!anyChange && rowsToWrite.length === 0 && processedRows > 0) {
     return { redCount: redCount, aborted: false };
-  }
-  
-  let rowsToWrite = [];
-  for (let i = 1; i < nextData.length; i++) {
-    const sheetRow = i + 1;
-    if (forceWriteRows.has(i)) { 
-      const safeBg = bg[i - 1] ? bg[i - 1].slice() : new Array(headers.length).fill("#ffffff");
-      rowsToWrite.push({ row: sheetRow, values: nextData[i].slice(), bg: safeBg }); 
-    }
   }
 
   if (rowsToWrite.length > 0) {
      executeSecureWrite("RISK_ENGINE", () => {
-       writeRowsInBatches(trackerSheet, rowsToWrite, headerMap);
+       writeRowsInBatches(trackerSheet, rowsToWrite, headerMap, manualColIndexes);
      });
   }
   
@@ -498,12 +660,16 @@ function evaluateDeadlineRisk(student, bgRow) {
   const today = new Date(); today.setHours(0,0,0,0);
   let worstDeadline = null, worstCol = null;
   let isResub = false;
+  
+  const CRM_COLUMNS = COLUMN_OWNERS.CRM;
+  const RISK_COLORS = new Set(["#ea9999", "#f6b26b", "#ffe599", "#fff2cc"]);
 
+  // Unconditionally wipe Risk colors ONLY on CRM-owned columns, preserving manual highlight colors
   for (const pFields of PROJECT_FIELDS) {
     const dCol = student.colIndex(pFields.dColName);
     const rCol = student.colIndex(pFields.rColName);
-    if (dCol !== undefined && COLUMN_OWNERS.CRM.has(pFields.dColName)) bgRow[dCol] = "#ffffff";
-    if (rCol !== undefined && COLUMN_OWNERS.CRM.has(pFields.rColName)) bgRow[rCol] = "#ffffff";
+    if (dCol !== undefined && CRM_COLUMNS.has(pFields.dColName) && RISK_COLORS.has(bgRow[dCol])) bgRow[dCol] = "#ffffff";
+    if (rCol !== undefined && CRM_COLUMNS.has(pFields.rColName) && RISK_COLORS.has(bgRow[rCol])) bgRow[rCol] = "#ffffff";
   }
 
   for (const pFields of PROJECT_FIELDS) {
@@ -546,18 +712,26 @@ function evaluateDeadlineRisk(student, bgRow) {
 function evaluateLmsRisk(student, bgRow) {
   let riskScore = 0;
   let reasons = [];
+  const RISK_COLORS = new Set(["#ea9999", "#f6b26b", "#ffe599", "#fff2cc"]);
+  
   if (student.has(H.LMS_ACT)) {
     const days = calculateDaysSince(student.get(H.LMS_ACT));
     let targetColor = "#ffffff";
-    if (days === null || days === "Future Date") {} 
+    
+    const tActCol = student.colIndex(H.LMS_ACT);
+    const tDaysCol = student.colIndex(H.LMS_DAYS);
+    
+    if (tActCol !== undefined && RISK_COLORS.has(bgRow[tActCol])) bgRow[tActCol] = "#ffffff";
+    if (tDaysCol !== undefined && RISK_COLORS.has(bgRow[tDaysCol])) bgRow[tDaysCol] = "#ffffff";
+
+    if (days === null) {} 
     else if (days > 30) { targetColor = "#ea9999"; riskScore += 2; reasons.push("LMS Inactive 30+ days"); } 
     else if (days > 14) { targetColor = "#f6b26b"; riskScore += 1; reasons.push("LMS Inactive 14+ days"); } 
     else if (days > 7) { targetColor = "#ffe599"; }
-    const tActCol = student.colIndex(H.LMS_ACT);
-    if (tActCol !== undefined) {
-       bgRow[tActCol] = targetColor;
-       const tDaysCol = student.colIndex(H.LMS_DAYS);
-       if (tDaysCol !== undefined) bgRow[tDaysCol] = targetColor;
+    
+    if (targetColor !== "#ffffff") {
+        if (tActCol !== undefined) bgRow[tActCol] = targetColor;
+        if (tDaysCol !== undefined) bgRow[tDaysCol] = targetColor;
     }
   }
   return { score: riskScore, reasons: reasons };
@@ -583,16 +757,22 @@ function evaluateRowRisk(student, bgRow) {
   }
 
   let isRed = false;
+  let totalRisk = Math.min(deadlineRisk + lmsRisk, 4);
+
   if (student.has(H.NAME)) {
     const nameColIdx = student.colIndex(H.NAME);
+    const RISK_COLORS = new Set(["#ea9999", "#f6b26b", "#ffe599", "#fff2cc"]);
     let targetColor = bgRow[nameColIdx] || "#ffffff"; 
-    let totalRisk = Math.min(deadlineRisk + lmsRisk, 4);
+    
+    if (RISK_COLORS.has(targetColor)) targetColor = "#ffffff";
+    
     if (deadlineRisk >= 3 || totalRisk >= 4) { targetColor = "#ea9999"; isRed = true; } 
     else if (totalRisk >= 2) { targetColor = "#f6b26b"; } 
     else if (totalRisk === 1) { targetColor = "#ffe599"; } 
+    
     bgRow[nameColIdx] = targetColor;
   }
-  return { isRed, flags: reasons };
+  return { isRed, totalRisk, flags: reasons };
 }
 
 // ================= DATA VALIDATION =================
@@ -601,7 +781,7 @@ function enforceDateValidation() {
   const lastCol = sheet.getLastColumn(), lastRow = sheet.getLastRow();
   if (lastRow <= 1 || lastCol === 0) return;
   const headersNorm = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(normHeader);
-  const dateCols = headersNorm.map((hNorm, i) => hNorm.includes("deadline") ? i : -1).filter(i => i !== -1);
+  const dateCols = headersNorm.map((hNorm, i) => hNorm.includes("deadline") ? i : undefined).filter(i => i !== undefined);
   if (dateCols.length === 0) return;
   const rule = SpreadsheetApp.newDataValidation().requireDate().setAllowInvalid(false).setHelpText("❌ Invalid Input: Please enter a valid date format (DD/MM/YYYY).").build();
   dateCols.forEach(col => sheet.getRange(2, col + 1, lastRow - 1).setDataValidation(rule));
@@ -612,7 +792,7 @@ function normalizeDeadlineDates() {
   const lastRow = sheet.getLastRow(), lastCol = sheet.getLastColumn();
   if (lastRow <= 1 || lastCol === 0) return;
   const headersNorm = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(normHeader);
-  const dateCols = headersNorm.map((hNorm, i) => hNorm.includes("deadline") ? i : -1).filter(i => i !== -1);
+  const dateCols = headersNorm.map((hNorm, i) => hNorm.includes("deadline") ? i : undefined).filter(i => i !== undefined);
   if (dateCols.length === 0) return;
   dateCols.forEach(colIdx => {
     const range = sheet.getRange(2, colIdx + 1, lastRow - 1, 1);
@@ -622,7 +802,7 @@ function normalizeDeadlineDates() {
        const orig = values[r][0];
        const parsed = parseRobustDate(orig);
        if (parsed !== orig && parsed instanceof Date) { values[r][0] = parsed; changed = true; } 
-       else if (parsed === "INVALID_DATE" || (orig && typeof orig === "string" && orig.toLowerCase().includes("invalid"))) { values[r][0] = ""; changed = true; }
+       else if (parsed === null && orig !== "") { values[r][0] = ""; changed = true; }
     }
     if (changed) range.setValues(values);
   });
@@ -669,12 +849,15 @@ function getSheetDataWithFormulas(sheet) {
   return values;
 }
 
-function writeRowsInBatches(sheet, rows, headerMap){
+function writeRowsInBatches(sheet, rows, headerMap, manualColIndexes = null){
   if(!rows.length) return;
   rows.sort((a,b)=>a.row-b.row);
   const maxRowRequired = Math.max(...rows.map(r => r.row));
   const maxRows = sheet.getMaxRows();
-  if (maxRowRequired > maxRows) sheet.insertRowsAfter(maxRows, maxRowRequired - maxRows + 20);
+  if (maxRowRequired > maxRows) {
+      sheet.insertRowsAfter(maxRows, Math.min(50, maxRowRequired - maxRows + 5));
+  }
+  
   let runs = [];
   for (const r of rows) {
     const hasVal = r.values !== null && r.values !== undefined;
@@ -692,20 +875,58 @@ function writeRowsInBatches(sheet, rows, headerMap){
     const executeWrite = () => {
       const startRow = Number(run.startRow);
       const numRows = Number(run.endRow - run.startRow + 1);
-      if (run.hasVal) {
-        const numCols = Number(run.values[0].length);
-        if (run.values.some(r => r.length !== numCols)) throw new Error(`Row width mismatch detected before write at row ${startRow}`);
-        sheet.getRange(startRow, 1, numRows, numCols).setValues(run.values);
-      }
-      if (run.hasBg) {
-        const numCols = Number(run.bg[0].length);
-        if (run.bg.some(r => r.length !== numCols)) throw new Error(`Background row width mismatch detected before write at row ${startRow}`);
-        sheet.getRange(startRow, 1, numRows, numCols).setBackgrounds(run.bg);
+      const numCols = run.hasVal ? Number(run.values[0].length) : (run.hasBg ? Number(run.bg[0].length) : 0);
+      
+      if (numCols > 0) {
+        if (sheet.getMaxRows() < startRow) {
+           throw new Error(`❌ CRITICAL: Sheet structure mutated externally during write phase (Row ${startRow} out of bounds). Aborting to prevent data corruption.`);
+        }
+        if (sheet.getLastColumn() !== numCols) {
+           throw new Error(`❌ CRITICAL: Sheet column count changed mid-execution. Expected ${numCols}, got ${sheet.getLastColumn()}. Aborting write.`);
+        }
+        
+        const targetRange = sheet.getRange(startRow, 1, numRows, numCols);
+        
+        if (run.hasVal && FEATURES.ALLOW_OVERWRITE_NON_MANUAL === false) {
+           const liveValues = targetRange.getValues();
+           const liveFormulas = targetRange.getFormulas();
+           for (let r = 0; r < numRows; r++) {
+               if (liveValues[r].length !== run.values[r].length) throw new Error("❌ Column mismatch detected.");
+               for (let cIdx = 0; cIdx < run.values[r].length; cIdx++) {
+                   const liveVal = liveFormulas[r][cIdx] ? liveFormulas[r][cIdx] : liveValues[r][cIdx];
+                   if (run.values[r][cIdx] !== liveVal) run.values[r][cIdx] = liveVal;
+               }
+           }
+        } else if (run.hasVal && manualColIndexes && manualColIndexes.length > 0) {
+          const liveValues = targetRange.getValues();
+          const liveFormulas = targetRange.getFormulas();
+          for (let r = 0; r < numRows; r++) {
+            if (liveValues[r].length !== run.values[r].length) {
+                throw new Error("❌ Column mismatch detected during JIT merge. Sheet structure may have changed. Aborting write to prevent data corruption.");
+            }
+            manualColIndexes.forEach(cIdx => {
+              if (cIdx < run.values[r].length) {
+                const liveVal = liveFormulas[r][cIdx] ? liveFormulas[r][cIdx] : liveValues[r][cIdx];
+                if (run.values[r][cIdx] !== liveVal) {
+                    run.values[r][cIdx] = liveVal; 
+                }
+              }
+            });
+          }
+        }
+
+        if (run.hasVal && run.hasBg) {
+            targetRange.setValues(run.values).setBackgrounds(run.bg);
+        } else if (run.hasVal) {
+            targetRange.setValues(run.values);
+        } else if (run.hasBg) {
+            targetRange.setBackgrounds(run.bg);
+        }
       }
     };
     try { executeWrite(); } 
     catch(e) { 
-      if(DEBUG_LOGS) console.log("Batch write failed, retrying...", e);
+      if(DEBUG_LOGS) console.log(`Batch write failed at row ${run.startRow}, retrying both values and backgrounds...`, e);
       try { Utilities.sleep(500); executeWrite(); } 
       catch (retryErr) { throw new Error(`❌ Write failed completely at row ${run.startRow}. Sheet may be out of sync.`); }
     }
@@ -716,7 +937,7 @@ function writeRowsInBatches(sheet, rows, headerMap){
 function initializeCoreSheets() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   let tracker = getOrCreateSheet(CONFIG.SHEETS.TRACKER);
-  if (tracker.getLastRow() === 0) {
+  if (tracker.getLastRow() === 0 || tracker.getLastColumn() === 0) {
     const headers = [
       CONFIG.CORE_FIELDS.NAME, "Course Of Interest Code", "Lead Status", "Discord Nickname", "Discord User ID",
       CONFIG.CORE_FIELDS.EMAIL, "Tag", "Cohort Facilitator"
@@ -744,7 +965,7 @@ function initializeCoreSheets() {
 
     headers.push("Additional Learning Needs / LLDD", CONFIG.CORE_FIELDS.ID);
 
-    if (FEATURES.RISK_ENGINE) { headers.push("Risk Flag", "Risk Reason"); }
+    if (FEATURES.RISK_ENGINE) { headers.push("Auto Risk Reason", "Risk Notes"); }
 
     tracker.getRange(1,1,1,headers.length).setValues([headers]); 
     tracker.setFrozenRows(1);
@@ -768,6 +989,7 @@ function onOpen() {
     .addItem('🎓 Sync Cypher LMS Activity', 'runLmsSyncOnly')
     .addItem('🐙 Update GitHub Activity', 'runGithubSyncOnly')
     .addSeparator()
+    .addItem('🧪 Run Setup Check', 'runSetupCheck')
     .addItem('⚙️ Change CRM Report Name', 'resetTrackerConfig')
     .addItem('🔓 Clear Crash Lock', 'resetCrashLock')
     .addItem('🔓 Allow Duplicate CRM File', 'resetCrmFileLock')
@@ -798,15 +1020,45 @@ function resetGithubCache() {
   showProgress(SpreadsheetApp.getActiveSpreadsheet(), "✅ GitHub API Caches cleared. Next sync will fetch fresh data.", "Caches Cleared", 5);
 }
 
+function runSetupCheck() {
+  try {
+    loadCourseType();
+    runPreflightChecks(true);
+    SpreadsheetApp.getActiveSpreadsheet().toast(
+      "✅ System is correctly configured",
+      "Setup Check",
+      5
+    );
+  } catch (e) {
+    SpreadsheetApp.getUi().alert(e.message);
+  }
+}
+
 // ================= MASTER ROUTER =================
+function setupSyncContext() {
+    const props = PropertiesService.getScriptProperties();
+    props.setProperty("ACTIVE_SYNC_CONTEXT", "TRUE");
+    HEADER_CACHE = {};
+    globalAmbiguousDateCount = 0;
+    globalUnknownHeaders = 0;
+    globalAliasCollisions = 0;
+}
+
+function teardownSyncContext() {
+    const props = PropertiesService.getScriptProperties();
+    props.deleteProperty("ACTIVE_SYNC_CONTEXT");
+}
+
 function runFullSync(){
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(30000)) { showProgress(SpreadsheetApp.getActiveSpreadsheet(), "⏳ Another sync is currently running. Please wait.", "Busy", 5); return; }
   
   checkCrashLock();
+  setupSyncContext();
   
   try {
     loadCourseType(); 
+    runPreflightChecks(false);
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const props = PropertiesService.getScriptProperties();
     props.deleteProperty("SYNC_STAGE"); props.deleteProperty("CRM_META"); props.deleteProperty("SYNC_STATS"); props.deleteProperty("LMS_STATS"); props.deleteProperty("GITHUB_STATS");
@@ -837,6 +1089,7 @@ function runFullSync(){
       riskStats = applyRiskEngine();
     }
     
+    if (globalAmbiguousDateCount > 0) console.warn(`⚠️ Encountered ${globalAmbiguousDateCount} ambiguous dates. Safely defaulted to ${CONFIG.EXPECTED_DATE_FORMAT} format based on CONFIG.`);
     const redCount = riskStats ? riskStats.redCount : 0;
     if (syncStats) syncStats.redCount = redCount;
     const validLmsStats = (lmsStats && !lmsStats.missingData) ? lmsStats : null;
@@ -846,7 +1099,10 @@ function runFullSync(){
     
   } catch (err) {
     console.error("❌ Sync Error:", err.stack || err); showProgress(SpreadsheetApp.getActiveSpreadsheet(), "❌ Sync failed: " + err.message, "Error", 10);
-  } finally { lock.releaseLock(); }
+  } finally { 
+      teardownSyncContext();
+      lock.releaseLock(); 
+  }
 }
 
 function runCrmSyncOnly(){
@@ -854,9 +1110,11 @@ function runCrmSyncOnly(){
   if (!lock.tryLock(30000)) { showProgress(SpreadsheetApp.getActiveSpreadsheet(), "⏳ Another sync is currently running. Please wait.", "Busy", 5); return; }
   
   checkCrashLock();
+  setupSyncContext();
   
   try {
     loadCourseType();
+    runPreflightChecks(false);
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     showProgress(ss, "Starting CRM Sync...", "Sync", -1);
     
@@ -874,12 +1132,16 @@ function runCrmSyncOnly(){
       riskStats = applyRiskEngine();
     }
     
+    if (globalAmbiguousDateCount > 0) console.warn(`⚠️ Encountered ${globalAmbiguousDateCount} ambiguous dates. Safely defaulted to ${CONFIG.EXPECTED_DATE_FORMAT} format based on CONFIG.`);
     const redCount = riskStats ? riskStats.redCount : 0;
     updateDashboard(crmMeta, syncStats, null, null, redCount);
     showProgress(ss, `✅ CRM Sync Complete! Added: ${syncStats ? syncStats.added : 0}, Updated: ${syncStats ? syncStats.updated : 0}`, "Done", 5);
   } catch (err) {
     console.error("❌ Sync Error:", err.stack || err); showProgress(SpreadsheetApp.getActiveSpreadsheet(), "❌ Sync failed: " + err.message, "Error", -1);
-  } finally { lock.releaseLock(); }
+  } finally { 
+      teardownSyncContext();
+      lock.releaseLock(); 
+  }
 }
 
 function runLmsSyncOnly(){
@@ -887,9 +1149,11 @@ function runLmsSyncOnly(){
   if (!lock.tryLock(30000)) { showProgress(SpreadsheetApp.getActiveSpreadsheet(), "⏳ Another sync is currently running. Please wait.", "Busy", 5); return; }
   
   checkCrashLock();
+  setupSyncContext();
   
   try {
     loadCourseType();
+    runPreflightChecks(false);
     if (!FEATURES.LMS_TRACKING) throw new Error("LMS Tracking is disabled for this course type.");
     
     const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -905,6 +1169,7 @@ function runLmsSyncOnly(){
       riskStats = applyRiskEngine();
     }
     
+    if (globalAmbiguousDateCount > 0) console.warn(`⚠️ Encountered ${globalAmbiguousDateCount} ambiguous dates. Safely defaulted to ${CONFIG.EXPECTED_DATE_FORMAT} format based on CONFIG.`);
     const redCount = riskStats ? riskStats.redCount : 0;
     
     if (lmsStats && lmsStats.missingData) {
@@ -915,7 +1180,10 @@ function runLmsSyncOnly(){
     }
   } catch (err) {
     console.error("❌ Sync Error:", err.stack || err); showProgress(SpreadsheetApp.getActiveSpreadsheet(), "❌ Sync failed: " + err.message, "Error", -1);
-  } finally { lock.releaseLock(); }
+  } finally { 
+      teardownSyncContext();
+      lock.releaseLock(); 
+  }
 }
 
 function runGithubSyncOnly(){
@@ -923,9 +1191,11 @@ function runGithubSyncOnly(){
   if (!lock.tryLock(30000)) { showProgress(SpreadsheetApp.getActiveSpreadsheet(), "⏳ Another sync is currently running. Please wait.", "Busy", 5); return; }
   
   checkCrashLock();
+  setupSyncContext();
   
   try {
     loadCourseType();
+    runPreflightChecks(false);
     if (!FEATURES.GITHUB_TRACKING) throw new Error("GitHub Tracking is disabled for this course type.");
     
     const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -941,6 +1211,7 @@ function runGithubSyncOnly(){
       riskStats = applyRiskEngine();
     }
     
+    if (globalAmbiguousDateCount > 0) console.warn(`⚠️ Encountered ${globalAmbiguousDateCount} ambiguous dates. Safely defaulted to ${CONFIG.EXPECTED_DATE_FORMAT} format based on CONFIG.`);
     const redCount = riskStats ? riskStats.redCount : 0;
     
     if (githubStats) {
@@ -949,33 +1220,53 @@ function runGithubSyncOnly(){
     }
   } catch (err) {
     console.error("❌ Sync Error:", err.stack || err); showProgress(SpreadsheetApp.getActiveSpreadsheet(), "❌ Sync failed: " + err.message, "Error", -1);
-  } finally { lock.releaseLock(); }
+  } finally { 
+      teardownSyncContext();
+      lock.releaseLock(); 
+  }
 }
 
 // ================= CRM SYNC ENGINE =================
 function importCrmFromEmail() {
+  verifySyncContext();
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   let sheet = getOrCreateSheet(CONFIG.SHEETS.CRM_RAW);
   sheet.clearContents();
   
   const fileIdentifier = PropertiesService.getDocumentProperties().getProperty("CRM_FILE_IDENTIFIER") || "student_data";
   
-  const threads = GmailApp.search(CRM_EMAIL_SEARCH_QUERY, 0, 5);
-  if (!threads.length) throw new Error(`❌ CRM email not found matching query: ${CRM_EMAIL_SEARCH_QUERY}`);
-  let latestAttachment = null; let latestMsgDate = 0;
+  let threads = GmailApp.search(buildCrmSearchQuery(fileIdentifier, true), 0, 5);
+  let latestAttachment = null; 
+  let latestMsgDate = 0;
+
+  if (!threads.length) {
+      threads = GmailApp.search(buildCrmSearchQuery(fileIdentifier, false), 0, 10);
+  }
+  
+  if (!threads.length) throw new Error(`❌ CRM email not found matching query.`);
+  
+  const normalizedTarget = fileIdentifier.toLowerCase().replace(/[\s_-]/g, "");
+
   for (const thread of threads) {
     const messages = thread.getMessages();
     for (const msg of messages) {
       const msgDate = msg.getDate().getTime();
       const found = msg.getAttachments().find(a => { 
         const name = a.getName().toLowerCase(); 
-        return name.endsWith(".csv") && name.includes(fileIdentifier.toLowerCase()); 
+        const normalizedName = name.replace(/[\s_-]/g, "");
+        const isCsv = name.endsWith(".csv") || a.getContentType() === "text/csv";
+        const validSize = a.getSize() > 500;
+        return isCsv && validSize && normalizedName.includes(normalizedTarget) && !name.includes("backup") && !name.includes("copy") && !name.includes("archive"); 
       });
       if (found && msgDate > latestMsgDate) { latestAttachment = found; latestMsgDate = msgDate; }
     }
   }
   if (!latestAttachment) throw new Error(`❌ No valid CRM CSV attachment found containing: '${fileIdentifier}'`);
   
+  if (Date.now() - latestMsgDate > MAX_FILE_AGE_MS) {
+      throw new Error(`❌ CRM file is too old (older than 7 days). Aborting sync to prevent stale overwrite.`);
+  }
+
   const fileName = latestAttachment.getName();
 
   let detectedCourseType = PropertiesService.getDocumentProperties().getProperty("COURSE_TYPE") || "L5"; 
@@ -987,15 +1278,35 @@ function importCrmFromEmail() {
   buildGlobals();
 
   const props = PropertiesService.getDocumentProperties(); const lastFile = props.getProperty("LAST_CRM_FILE");
-  if (fileName === lastFile) throw new Error("Duplicate CRM file detected. Sync aborted. Use 'Student Tracker > 🔓 Allow Duplicate CRM File' from the menu to force bypass.");
-  props.setProperty("LAST_CRM_FILE", fileName);
+  const fileKey = fileName + "_" + latestMsgDate;
+  if (fileKey === lastFile) throw new Error("Duplicate CRM file detected. Sync aborted. Use 'Student Tracker > 🔓 Allow Duplicate CRM File' from the menu to force bypass.");
+  props.setProperty("LAST_CRM_FILE", fileKey);
   
   const data = Utilities.parseCsv(latestAttachment.getDataAsString());
-  let generatedDate = "Not Found"; const genString = data[2] ? data[2][0] : ""; const dateMatch = genString.match(/(\d{2}\/\d{2}\/\d{4} \d{2}:\d{2} [AP]M)/);
-  if (dateMatch) {
-    const [d, m, y, h, min, mer] = dateMatch[0].split(/[\/\s:]/); let hours = parseInt(h);
-    if (mer === "PM" && hours < 12) hours += 12; if (mer === "AM" && hours === 12) hours = 0;
-    generatedDate = new Date(y, m - 1, d, hours, min);
+  
+  let headerIdx = -1; 
+  let normHeaders = [];
+  for (let i = 0; i < Math.min(data.length, 30); i++) {
+    const rowNorm = data[i].map(normHeader);
+    if (rowNorm.includes(H.EMAIL) && rowNorm.includes(H.NAME)) { 
+        headerIdx = i; normHeaders = rowNorm; break; 
+    }
+  }
+  
+  if (headerIdx === -1) {
+      throw new Error(`❌ Fetched CSV does not contain 'Email' and 'Name' columns in the first 30 rows. Invalid CRM export format.`);
+  }
+
+  let generatedDate = "Not Found"; 
+  for (let i = 0; i < headerIdx; i++) {
+      const genString = data[i].join(" ");
+      const dateMatch = genString.match(/(\d{2}\/\d{2}\/\d{4} \d{2}:\d{2} [AP]M)/);
+      if (dateMatch) {
+          const [d, m, y, h, min, mer] = dateMatch[0].split(/[\/\s:]/); let hours = parseInt(h);
+          if (mer === "PM" && hours < 12) hours += 12; if (mer === "AM" && hours === 12) hours = 0;
+          generatedDate = new Date(y, m - 1, d, hours, min);
+          break;
+      }
   }
   
   function parseUKDateToJS(value) {
@@ -1004,13 +1315,6 @@ function importCrmFromEmail() {
     const [day, month, year] = parts.map(Number); const d = new Date(year, month - 1, day); d.setHours(0,0,0,0); return d;
   }
   
-  let headerIdx = -1; let normHeaders = [];
-  for (let i = 0; i < Math.min(data.length, 30); i++) {
-    const rowNorm = data[i].map(normHeader);
-    if (rowNorm.includes(H.EMAIL) && rowNorm.includes(H.NAME)) { headerIdx = i; normHeaders = rowNorm; break; }
-  }
-  if (headerIdx === -1) throw new Error("❌ CRM headers not found in email attachment. Check execution logs.");
-  
   const dateCols = normHeaders.map((hNorm, i) => ({ name: hNorm, index: i })).filter(h => h.name.includes("deadline") || h.name.includes("submission_deadline")).map(h => h.index);
   for (let i = headerIdx + 1; i < data.length; i++) { dateCols.forEach(c => { data[i][c] = parseUKDateToJS(data[i][c]); }); }
   sheet.getRange(1, 1, data.length, data[0].length).setValues(data);
@@ -1018,6 +1322,7 @@ function importCrmFromEmail() {
 }
 
 function syncCrmToTracker() {
+  verifySyncContext();
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const crmSheet = getOrCreateSheet(CONFIG.SHEETS.CRM_RAW);
   const trackerSheet = getOrCreateSheet(CONFIG.SHEETS.TRACKER);
@@ -1031,9 +1336,14 @@ function syncCrmToTracker() {
   if (headerIdx === -1) throw new Error("❌ Could not detect CRM headers properly.");
   const crmDataOnly = raw.slice(headerIdx); 
   
-  if (crmDataOnly.length < 2) throw new Error(`❌ CRM dataset is unusually small (${crmDataOnly.length} rows). Aborting to prevent mass deletion.`);
+  const tracker = getSheetDataWithFormulas(trackerSheet);
+  if (!tracker || tracker.length === 0 || !tracker[0]) throw new Error("❌ Student Tracker sheet is empty or corrupted.");
   
-  const crmMap = buildHeaderMap(crmHeadersNorm);
+  if (tracker.length > 20 && crmDataOnly.length < (tracker.length * 0.2)) {
+      throw new Error(`❌ CRM dataset is suspiciously small (${crmDataOnly.length} rows vs ${tracker.length} tracker rows). Aborting to prevent mass deletion.`);
+  }
+  
+  const crmMap = getHeaderMap(CONFIG.SHEETS.CRM_RAW, crmHeadersNorm, false);
   const CRITICAL_SYNC_FIELDS = new Set([H.EMAIL, H.NAME, H.ID, H.COURSE_CODE]);
   CRITICAL_SYNC_FIELDS.forEach(f => { if (crmMap[f] === undefined) throw new Error(`❌ Critical CRM field missing: ${f}. Schema drift detected.`); });
 
@@ -1047,14 +1357,14 @@ function syncCrmToTracker() {
   const seenIds = new Set();
   for (let i = 1; i < crmDataOnly.length; i++) {
     const crmStudent = createRowModel(crmDataOnly[i], crmMap);
-    const id = normId(crmStudent.get(H.ID));
-    if (id && seenIds.has(id)) { throw new Error(`❌ Duplicate Record Id in CRM: ${crmStudent.get(H.ID)} (Normalized: ${id})`); }
+    const rawId = crmStudent.get(H.ID);
+    const id = normId(rawId);
+    if (id && seenIds.has(id)) { 
+        throw new Error(`❌ Duplicate Record Id in CRM: '${rawId}' (Normalized: '${id}'). Please fix duplicates in Zoho before syncing.`); 
+    }
     if (id) seenIds.add(id);
   }
 
-  let tracker = getSheetDataWithFormulas(trackerSheet);
-  if (!tracker || tracker.length === 0 || !tracker[0]) throw new Error("❌ Student Tracker sheet is empty or corrupted.");
-  
   const originalTrackerSize = tracker.length - 1; 
   
   let bgColors = [];
@@ -1063,9 +1373,17 @@ function syncCrmToTracker() {
   
   const trackerHeaders = tracker[0];
   const trackerHeadersNorm = trackerHeaders.map(normHeader);
-  const headerMap = buildHeaderMap(trackerHeadersNorm, true);
+  const headerMap = getHeaderMap(CONFIG.SHEETS.TRACKER, trackerHeadersNorm, true);
 
-  COLUMN_OWNERS.CRM.forEach(hNorm => { if (headerMap[hNorm] === undefined) throw new Error(`❌ Tracker missing CRM column: ${hNorm}. Please restore this column.`); });
+  const CRM_COLUMNS = COLUMN_OWNERS.CRM;
+  
+  const manualColIndexes = [];
+  COLUMN_OWNERS.MANUAL.forEach(field => {
+      const idx = headerMap[field];
+      if (idx !== undefined) manualColIndexes.push(idx);
+  });
+
+  CRM_COLUMNS.forEach(hNorm => { if (headerMap[hNorm] === undefined) throw new Error(`❌ Tracker missing CRM column: ${hNorm}. Please restore this column.`); });
   while (bgColors.length < tracker.length - 1) bgColors.push(new Array(trackerHeaders.length).fill("#ffffff"));
 
   const activeCrmKeys = new Set();
@@ -1084,39 +1402,44 @@ function syncCrmToTracker() {
     const emailStr = normEmail(trackerStudent.get(H.EMAIL));
     const idKey = id ? "ID:" + id : null;
     const emailKey = emailStr ? "EMAIL:" + emailStr : null;
-    let existsInCRM = false;
     
+    if (!id && (!emailStr || emailStr === "")) continue; 
+    
+    let existsInCRM = false;
     if (idKey) existsInCRM = activeCrmKeys.has(idKey);
     else if (emailKey) existsInCRM = activeCrmKeys.has(emailKey);
     
-    if (!id && (!emailStr || emailStr === "")) potentialRemovals++;
-    else if (!existsInCRM) potentialRemovals++;
+    if (!existsInCRM) potentialRemovals++;
   }
   
-  const MASS_DELETE_THRESHOLD_RATIO = 0.20;
-  const MASS_DELETE_THRESHOLD_ABSOLUTE = 40; 
   const removalRatio = originalTrackerSize > 0 ? (potentialRemovals / originalTrackerSize) : 0;
   let skipDeletions = false;
+  const FORCE_DELETE = PropertiesService.getScriptProperties().getProperty("ALLOW_AUTO_DELETE") === "true";
 
-  if (originalTrackerSize > 10 && (removalRatio > MASS_DELETE_THRESHOLD_RATIO || potentialRemovals > MASS_DELETE_THRESHOLD_ABSOLUTE)) {
+  if (originalTrackerSize > 10 && removalRatio > 0.30 && !FORCE_DELETE) {
+      throw new Error(`❌ CRITICAL: Mass deletion of ${potentialRemovals} students (${Math.round(removalRatio * 100)}%) detected. Hard abort triggered to prevent catastrophic data loss. Set 'ALLOW_AUTO_DELETE' to 'true' in script properties to override.`);
+  }
+
+  if (originalTrackerSize > 10 && (potentialRemovals > 20 || removalRatio > 0.15)) {
     try {
-      const ui = SpreadsheetApp.getUi();
-      const response = ui.alert(
-        "⚠️ Mass Deletion Warning",
-        `The CRM sync is about to remove ${potentialRemovals} students (${Math.round(removalRatio * 100)}% of your tracker).\n\nThis is completely normal if a cohort just graduated. However, if your CRM CSV export was incomplete or filtered by mistake, you could lose data.\n\nDo you want to PROCEED and permanently delete these ${potentialRemovals} students from the tracker?`,
-        ui.ButtonSet.YES_NO
-      );
-      
-      if (response !== ui.Button.YES) {
-        console.warn(`User aborted mass deletion of ${potentialRemovals} students.`);
-        skipDeletions = true;
-        SpreadsheetApp.getActiveSpreadsheet().toast(`Skipped deleting ${potentialRemovals} students to protect data.`, "Safety Abort", 8);
+      const activeUser = Session.getActiveUser().getEmail();
+      if (!activeUser) {
+          if (!FORCE_DELETE) skipDeletions = true;
       } else {
-        console.log(`User authorized mass deletion of ${potentialRemovals} students.`);
+          const ui = SpreadsheetApp.getUi();
+          const response = ui.alert(
+            "⚠️ Mass Deletion Warning",
+            `The CRM sync is about to remove ${potentialRemovals} students (${Math.round(removalRatio * 100)}% of your tracker).\n\nThis is completely normal if a cohort just graduated. However, if your CRM CSV export was incomplete or filtered by mistake, you could lose data.\n\nDo you want to PROCEED and permanently delete these ${potentialRemovals} students from the tracker?`,
+            ui.ButtonSet.YES_NO
+          );
+          
+          if (response !== ui.Button.YES) {
+            skipDeletions = true;
+            SpreadsheetApp.getActiveSpreadsheet().toast(`Skipped deleting ${potentialRemovals} students to protect data.`, "Safety Abort", 8);
+          }
       }
     } catch (e) {
-      console.error(`⚠️ Large Deletion Detected (${potentialRemovals} students). Running in background, skipping deletion automatically to prevent data loss.`);
-      skipDeletions = true;
+      if (!FORCE_DELETE) skipDeletions = true;
     }
   }
   
@@ -1160,29 +1483,33 @@ function syncCrmToTracker() {
         const existingRow = createRowModel(nextTracker[possible], headerMap);
         const existingId = normId(existingRow.get(H.ID));
         if (!existingId) { rowIndex = possible; } 
+        else if (existingId && existingId !== id) { 
+           // Never blindly overwrite an existing ID during identity conflict resolution
+           rowIndex = possible;
+        } 
         else if (existingId === id) { rowIndex = possible; } 
-        else { 
-           if (DEBUG_LOGS) console.warn(`⚠️ Identity Conflict: Email ${emailStr} exists but ID changed (${existingId} -> ${id}). Forcing new record creation.`);
-           rowIndex = undefined;
-        }
       }
     }
       
-    if (id && emailStr && existingByEmail[emailStr] !== undefined && existingByEmail[emailStr] !== rowIndex) delete existingByEmail[emailStr];
     if (rowIndex !== undefined && emailStr) existingByEmail[emailStr] = rowIndex;
     if (rowIndex !== undefined && id) existingById[id] = rowIndex; 
     
     if (rowIndex !== undefined && rowIndex !== null && !isNaN(rowIndex)) {
       const origRowCopy = nextTracker[rowIndex].slice();
-      const trackerStudent = createRowModel(nextTracker[rowIndex], headerMap, COLUMN_OWNERS.MANUAL);
+      const origHash = fastHash(origRowCopy);
+      const trackerStudent = createRowModel(nextTracker[rowIndex], headerMap);
       
       let criticalMismatch = false;
       const existingRawId = trackerStudent.get(H.ID);
       const existingNormId = normId(existingRawId);
       
       if (isDifferent(existingNormId, id) || isDifferent(existingRawId, id)) {
-        trackerStudent.set(H.ID, id);
-        criticalMismatch = true;
+        if (!existingNormId && id) {
+           trackerStudent.set(H.ID, id);
+           criticalMismatch = true;
+        } else {
+           throw new Error(`❌ Identity Conflict: Attempted to overwrite existing ID '${existingNormId}' with new ID '${id}' for Email '${emailStr}'. Fix in Zoho CRM before syncing.`);
+        }
       }
       
       const existingEmail = trackerStudent.get(H.EMAIL);
@@ -1191,8 +1518,9 @@ function syncCrmToTracker() {
         criticalMismatch = true;
       }
       
-      COLUMN_OWNERS.CRM.forEach(hNorm => {
-        if (hNorm === H.PATHWAY || hNorm === H.PROJ_SUB || hNorm === H.RISK_FLAG || hNorm === H.RISK_REASON || hNorm === H.ID || hNorm === H.EMAIL) return;
+      CRM_COLUMNS.forEach(hNorm => {
+        if (!CRM_COLUMNS.has(hNorm)) return;
+        if (hNorm === H.PATHWAY || hNorm === H.PROJ_SUB || hNorm === H.AUTO_RISK_REASON || hNorm === H.RISK_NOTES || hNorm === H.ID || hNorm === H.EMAIL) return;
         const tIdx = headerMap[hNorm];
         if (tIdx === undefined) return;
         if (!crmStudent.has(hNorm)) {
@@ -1216,8 +1544,7 @@ function syncCrmToTracker() {
         if (hNorm.includes(H.SUB_STATUS)) val = mapStatus(val);
         if (hNorm === H.DISC_ID && val && val.toString().trim() !== "") val = applyDiscordLink(val);
         
-        const currentVal = trackerStudent.get(hNorm);
-        if (isDifferent(currentVal, val)) trackerStudent.set(hNorm, val);
+        trackerStudent.safeSet(hNorm, val);
       }); 
       
       if (FEATURES.PROJECT_TRACKING) {
@@ -1235,11 +1562,18 @@ function syncCrmToTracker() {
            if (status && CONFIG.RISK.SUBMITTED_STATUSES.some(s => status.toString().toLowerCase().trim().includes(s))) submittedCountCalc++;
         }
         
-        if (trackerStudent.has(H.PATHWAY)) { if (isDifferent(trackerStudent.get(H.PATHWAY), pathwayCalc)) trackerStudent.set(H.PATHWAY, pathwayCalc); }
-        if (trackerStudent.has(H.PROJ_SUB)) { if (isDifferent(trackerStudent.get(H.PROJ_SUB), submittedCountCalc)) trackerStudent.set(H.PROJ_SUB, submittedCountCalc); }
+        if (trackerStudent.has(H.PATHWAY)) trackerStudent.safeSet(H.PATHWAY, pathwayCalc);
+        if (trackerStudent.has(H.PROJ_SUB)) trackerStudent.safeSet(H.PROJ_SUB, submittedCountCalc);
       }
       
-      const rowActuallyChanged = fastHash(origRowCopy) !== fastHash(nextTracker[rowIndex]);
+      if (nextTracker[rowIndex]) {
+        manualColIndexes.forEach(tIdx => {
+          nextTracker[rowIndex][tIdx] = tracker[rowIndex][tIdx];
+        });
+      }
+
+      const newHash = fastHash(nextTracker[rowIndex]);
+      const rowActuallyChanged = origHash !== newHash;
       
       if (rowActuallyChanged || criticalMismatch) {
         updated++;
@@ -1253,16 +1587,16 @@ function syncCrmToTracker() {
 
     } else {
       const newRow = new Array(trackerHeaders.length).fill("");
-      const newTrackerStudent = createRowModel(newRow, headerMap, COLUMN_OWNERS.MANUAL);
+      const newTrackerStudent = createRowModel(newRow, headerMap);
       
       newTrackerStudent.set(H.ID, id);
       newTrackerStudent.set(H.EMAIL, emailStr);
       
-      COLUMN_OWNERS.CRM.forEach(hNorm => {
+      CRM_COLUMNS.forEach(hNorm => {
+        if (!CRM_COLUMNS.has(hNorm)) return;
         const tIdx = headerMap[hNorm];
         if (tIdx === undefined) return;
-        if (COLUMN_OWNERS.MANUAL.has(hNorm) || hNorm === H.PATHWAY || hNorm === H.PROJ_SUB || hNorm === H.ID || hNorm === H.EMAIL) return; 
-        if (!COLUMN_OWNERS.CRM.has(hNorm) && hNorm !== H.ID) return;
+        if (hNorm === H.PATHWAY || hNorm === H.PROJ_SUB || hNorm === H.ID || hNorm === H.EMAIL) return; 
         if (!crmStudent.has(hNorm)) { trackSkip(hNorm); return; }
         
         let val = crmStudent.get(hNorm);
@@ -1299,8 +1633,6 @@ function syncCrmToTracker() {
       nextTracker.push(newTrackerStudent.raw);
       const newRowIndex = nextTracker.length - 1;
       
-      if (nextTracker.length > trackerSheet.getMaxRows()) trackerSheet.insertRowsAfter(trackerSheet.getMaxRows(), Math.max(20, nextTracker.length - trackerSheet.getMaxRows()));
-      
       forceWriteRows.add(newRowIndex);
       nextBgColors.push(new Array(trackerHeaders.length).fill("#ffffff"));
       added++;
@@ -1308,16 +1640,7 @@ function syncCrmToTracker() {
       auditLogs.push([ logDate, crmStudent.get(H.NAME) || "Unknown", crmStudent.get(H.COURSE_CODE) || "Unknown", "ADDED" ]);
     }
   }
-  
-  if (processedRows === 0 && crmDataOnly.length > 0) {
-    throw new Error("❌ CRITICAL: No CRM rows successfully processed. Aborting to prevent blank overwrite.");
-  }
 
-  if (DEBUG_LOGS && missingFromExportCount > 0) {
-    console.log(`CRM Sync - Missing CRM fields in export (real issue): ${missingFromExportCount}`);
-    console.log("CRM Missing fields breakdown:", JSON.stringify(missingFromExportNames, null, 2));
-  }
-  
   let removedFromCrm = 0; let removedNoId = 0; const rowsToDelete = [];
   
   for (let i = nextTracker.length - 1; i >= 1; i--) {
@@ -1327,28 +1650,24 @@ function syncCrmToTracker() {
     const idKey = id ? "ID:" + id : null;
     const emailKey = emailStr ? "EMAIL:" + emailStr : null;
     
+    if (!id && (!emailStr || emailStr === "")) {
+      continue; 
+    }
+    
     let existsInCRM = false;
     if (idKey) existsInCRM = activeCrmKeys.has(idKey);
     else if (emailKey) existsInCRM = activeCrmKeys.has(emailKey);
     
-    if (!id && (!emailStr || emailStr === "")) {
+    if (!existsInCRM) {
       auditLogs.push([ logDate, trackerStudent.get(H.NAME) || "Unknown", trackerStudent.get(H.COURSE_CODE) || "Unknown", "REMOVED" ]);
-      if (!skipDeletions) rowsToDelete.push(i + 1);
-      removedNoId++; anyChange = true;
-    } else if (!existsInCRM) {
-      auditLogs.push([ logDate, trackerStudent.get(H.NAME) || "Unknown", trackerStudent.get(H.COURSE_CODE) || "Unknown", "REMOVED" ]);
-      if (!skipDeletions) rowsToDelete.push(i + 1); 
+      if (!skipDeletions) rowsToDelete.push({ row: i + 1, id: id, email: emailStr }); 
       removedFromCrm++; anyChange = true;
     }
   }
 
-  const deleteSet = new Set(rowsToDelete);
+  const deleteSet = new Set(rowsToDelete.map(t => t.row));
   
   if (!anyChange && forceWriteRows.size === 0 && rowsToDelete.length === 0) {
-    if (DEBUG_LOGS) {
-      console.log("✅ No changes detected in CRM Sync. (Normal if re-running identical data)");
-      console.log(JSON.stringify({ module: "CRM_SYNC", processedRows, forceWriteRows: forceWriteRows.size, reason: "no_diff_detected" }));
-    }
     return { added, updated, unchanged, removedFromCrm, removedNoId, aborted: false, syncTime: new Date() };
   }
 
@@ -1361,25 +1680,31 @@ function syncCrmToTracker() {
     }
   }
 
-  if (DEBUG_LOGS) {
-    console.log("=== WRITE DEBUG (CRM) ===");
-    console.log("DeleteSet:", Array.from(deleteSet));
-    console.log("ForceWriteRows:", Array.from(forceWriteRows));
-    console.log("rowsToWrite:", rowsToWrite.length);
-    console.log("rowsToDelete:", rowsToDelete.length);
-    console.log("processedRows:", processedRows);
-    console.log("nextTracker length:", nextTracker.length);
-  }
-
   while (nextBgColors.length < nextTracker.length - 1) { nextBgColors.push(new Array(trackerHeaders.length).fill("#ffffff")); }
 
   shouldStop(); 
   
   if (rowsToWrite.length > 0 || rowsToDelete.length > 0) {
     executeSecureWrite("CRM_WRITE", () => {
-      if (rowsToWrite.length > 0) writeRowsInBatches(trackerSheet, rowsToWrite, headerMap);
+      if (rowsToWrite.length > 0) writeRowsInBatches(trackerSheet, rowsToWrite, headerMap, manualColIndexes);
       if (rowsToDelete.length > 0) {
-        try { rowsToDelete.sort((a,b) => b - a).forEach(r => trackerSheet.deleteRow(r)); } 
+        try { 
+            const idCol = headerMap[H.ID] !== undefined ? headerMap[H.ID] + 1 : null;
+            const emailCol = headerMap[H.EMAIL] !== undefined ? headerMap[H.EMAIL] + 1 : null;
+            
+            rowsToDelete.sort((a,b) => b.row - a.row).forEach(target => {
+                if (idCol && emailCol) {
+                    const liveId = normId(trackerSheet.getRange(target.row, idCol).getValue());
+                    const liveEmail = normEmail(trackerSheet.getRange(target.row, emailCol).getValue());
+                    
+                    if ((target.id && liveId !== target.id) || (target.email && liveEmail !== target.email)) {
+                        console.warn(`⚠️ Race condition averted: Row ${target.row} shifted mid-run. Skipped deletion.`);
+                        return;
+                    }
+                }
+                trackerSheet.deleteRow(target.row); 
+            }); 
+        } 
         catch (e) { throw new Error(`❌ CRITICAL: Row deletion failed. Error: ${e.message}`); }
       }
     });
@@ -1396,6 +1721,7 @@ function syncCrmToTracker() {
 
 // ================= CYPHER LMS SYNC =================
 function runLmsSync() {
+  verifySyncContext();
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const trackerSheet = getOrCreateSheet(CONFIG.SHEETS.TRACKER);
   const lmsSheet = getOrCreateSheet(CONFIG.SHEETS.LMS_RAW);
@@ -1404,7 +1730,7 @@ function runLmsSync() {
   if (lmsData.length <= 1 || (lmsData.length === 1 && lmsData[0][0].toString().includes("Paste Cypher"))) return { missingData: true };
   
   const lmsHeadersNorm = lmsData[0].map(normHeader);
-  const lmsHeaderMap = buildHeaderMap(lmsHeadersNorm);
+  const lmsHeaderMap = getHeaderMap(CONFIG.SHEETS.LMS_RAW, lmsHeadersNorm, false);
   
   if (lmsHeaderMap[normHeader("email")] === undefined && lmsHeaderMap[H.ID] === undefined) {
       showProgress(ss, "❌ No valid identifier (Email or Learner ID) found in Cypher data.", "Error", 5);
@@ -1414,7 +1740,7 @@ function runLmsSync() {
   const trackerData = getSheetDataWithFormulas(trackerSheet);
   const headers = trackerData[0]; 
   const headersNorm = headers.map(normHeader);
-  const headerMap = buildHeaderMap(headersNorm, true);
+  const headerMap = getHeaderMap(CONFIG.SHEETS.TRACKER, headersNorm, true);
   
   if (headerMap[H.EMAIL] === undefined) throw new Error(`❌ Student Tracker missing '${CONFIG.CORE_FIELDS.EMAIL}' column.`);
 
@@ -1427,7 +1753,6 @@ function runLmsSync() {
   const forceWriteRows = new Set();
   const lmsMapById = {};
   const lmsMapByEmail = {};
-  let lmsDuplicates = 0;
   
   for (let i = 1; i < lmsData.length; i++) {
     const lmsStudent = createRowModel(lmsData[i], lmsHeaderMap);
@@ -1450,71 +1775,84 @@ function runLmsSync() {
     if (idStr) {
       if (!lmsMapById[idStr]) lmsMapById[idStr] = payload;
       else {
-        lmsDuplicates++;
         let ex = lmsMapById[idStr].date;
-        if (pDate instanceof Date && (ex === NEVER || !ex || pDate > ex)) lmsMapById[idStr] = payload;
+        if (pDate instanceof Date && (isNever(ex) || !ex || pDate > ex)) lmsMapById[idStr] = payload;
       }
     }
     if (emailStr) {
       if (!lmsMapByEmail[emailStr]) lmsMapByEmail[emailStr] = payload;
       else {
-        lmsDuplicates++;
         let ex = lmsMapByEmail[emailStr].date;
-        if (pDate instanceof Date && (ex === NEVER || !ex || pDate > ex)) lmsMapByEmail[emailStr] = payload;
+        if (pDate instanceof Date && (isNever(ex) || !ex || pDate > ex)) lmsMapByEmail[emailStr] = payload;
       }
     }
   }
 
-  if (DEBUG_LOGS && lmsDuplicates > 0) console.log(`ℹ️ Resolved ${lmsDuplicates} duplicate rows in LMS export.`);
-  
   let updatedCount = 0, unchangedCount = 0;
   let processedRows = 0; 
   let anyChange = false;
   
   const unmatched = [["Generated At", new Date()], ["", ""], ["Unmatched Email / ID", "Student Name"]]; 
+  const unmatchedSet = new Set();
   const nextTrackerData = trackerData.map(r => r.slice());
+  
+  const manualColIndexes = [];
+  COLUMN_OWNERS.MANUAL.forEach(field => {
+      const idx = headerMap[field];
+      if (idx !== undefined) manualColIndexes.push(idx);
+  });
 
   for (let i = 1; i < nextTrackerData.length; i++) {
     shouldStop(); 
-    const trackerStudent = createRowModel(nextTrackerData[i], headerMap, COLUMN_OWNERS.MANUAL);
+    const trackerStudent = createRowModel(nextTrackerData[i], headerMap);
     const emailStr = normEmail(trackerStudent.get(H.EMAIL));
     const idStr = normId(trackerStudent.get(H.ID));
     if (!emailStr && !idStr) continue;
     
     processedRows++;
     const origRowCopy = nextTrackerData[i].slice();
+    const origHash = fastHash(origRowCopy);
     let data = null;
     
-    if (idStr && lmsMapById[idStr]) data = lmsMapById[idStr];
-    else if (emailStr && lmsMapByEmail[emailStr]) data = lmsMapByEmail[emailStr];
+    if (idStr && lmsMapById[idStr]) {
+       data = lmsMapById[idStr];
+       if (emailStr && lmsMapByEmail[emailStr] && lmsMapById[idStr] !== lmsMapByEmail[emailStr]) {
+           if (DEBUG_LOGS) console.warn(`⚠️ LMS Match: ID and Email map to different records for ${emailStr}. Trusting ID.`);
+       }
+    } else if (emailStr && lmsMapByEmail[emailStr]) {
+       data = lmsMapByEmail[emailStr];
+       if (idStr && !lmsMapById[idStr]) {
+           if (DEBUG_LOGS) console.warn(`⚠️ LMS Match: Matched by Email for ${emailStr}, but Learner ID ${idStr} was not found in export.`);
+       }
+    }
     
     if (data) {
        if (trackerStudent.has(H.LMS_ACT)) {
-         let newDate = data.date === NEVER ? NEVER : data.date;
-         if (isDifferent(trackerStudent.get(H.LMS_ACT), newDate)) trackerStudent.set(H.LMS_ACT, newDate);
+         let newDate = isNever(data.date) ? NEVER : data.date;
+         trackerStudent.safeSet(H.LMS_ACT, newDate);
        }
        if (trackerStudent.has(H.LMS_PROG)) {
          let progVal = data.progress;
          if (typeof progVal === "string") progVal = progVal.replace(",", ".").replace(/[^\d.]/g, "");
-         let parsedProg = (progVal !== "" && !isNaN(parseFloat(progVal))) ? parseFloat(progVal) / 100 : 0;
-         if (isDifferent(trackerStudent.get(H.LMS_PROG), parsedProg)) trackerStudent.set(H.LMS_PROG, parsedProg);
+         let num = (progVal !== "" && !isNaN(parseFloat(progVal))) ? parseFloat(progVal) : 0;
+         let parsedProg = num > 1 ? num / 100 : num; 
+         trackerStudent.safeSet(H.LMS_PROG, parsedProg);
        }
        if (trackerStudent.has(H.LMS_LES)) {
-         if (isDifferent(trackerStudent.get(H.LMS_LES), data.lesson)) trackerStudent.set(H.LMS_LES, data.lesson);
+         trackerStudent.safeSet(H.LMS_LES, data.lesson);
        }
     } else {
        const stuName = trackerStudent.has(H.NAME) ? trackerStudent.get(H.NAME) : "Unknown";
-       unmatched.push([idStr ? `ID: ${idStr}` : emailStr, stuName]);
+       const unmatchKey = idStr ? `ID: ${idStr}` : emailStr;
+       if (!unmatchedSet.has(unmatchKey)) {
+           unmatchedSet.add(unmatchKey);
+           unmatched.push([unmatchKey, stuName]);
+       }
        
        if (trackerStudent.has(H.LMS_ACT)) {
          const currentAct = trackerStudent.get(H.LMS_ACT);
-         if ((currentAct === undefined || currentAct === null || currentAct === "") && currentAct !== NEVER) {
-           if (isDifferent(currentAct, NEVER)) trackerStudent.set(H.LMS_ACT, NEVER);
-         }
-       }
-       if (trackerStudent.has(H.LMS_PROG)) {
-         if (trackerStudent.get(H.LMS_PROG) === "") {
-             if (isDifferent(trackerStudent.get(H.LMS_PROG), 0)) trackerStudent.set(H.LMS_PROG, 0);
+         if ((currentAct === undefined || currentAct === null || currentAct === "") && !isNever(currentAct)) {
+           trackerStudent.safeSet(H.LMS_ACT, NEVER);
          }
        }
     }
@@ -1522,14 +1860,22 @@ function runLmsSync() {
     if (trackerStudent.has(H.LMS_DAYS)) {
       const days = calculateDaysSince(trackerStudent.get(H.LMS_ACT));
       if (days !== null) {
-          if (isDifferent(trackerStudent.get(H.LMS_DAYS), days)) trackerStudent.set(H.LMS_DAYS, days);
+          trackerStudent.safeSet(H.LMS_DAYS, days);
       } else {
-          let fallback = trackerStudent.get(H.LMS_ACT) === NEVER ? NEVER : "";
-          if (isDifferent(trackerStudent.get(H.LMS_DAYS), fallback)) trackerStudent.set(H.LMS_DAYS, fallback);
+          let fallback = isNever(trackerStudent.get(H.LMS_ACT)) ? NEVER : "";
+          trackerStudent.safeSet(H.LMS_DAYS, fallback);
       }
     }
 
-    const rowActuallyChanged = fastHash(origRowCopy) !== fastHash(nextTrackerData[i]);
+    if (nextTrackerData[i]) {
+      manualColIndexes.forEach(tIdx => {
+        nextTrackerData[i][tIdx] = trackerData[i][tIdx];
+      });
+    }
+
+    const newHash = fastHash(nextTrackerData[i]);
+    const rowActuallyChanged = origHash !== newHash;
+
     if (rowActuallyChanged) {
       updatedCount++; forceWriteRows.add(i); anyChange = true; logDiff(origRowCopy, nextTrackerData[i], headerMap, emailStr || idStr);
     } else { unchangedCount++; }
@@ -1540,10 +1886,6 @@ function runLmsSync() {
   }
   
   if (!anyChange && forceWriteRows.size === 0 && processedRows > 0) {
-    if (DEBUG_LOGS) {
-      console.log("✅ No changes detected in LMS Sync. (Normal if re-running identical data)");
-      console.log(JSON.stringify({ module: "LMS_SYNC", processedRows, forceWriteRows: forceWriteRows.size, reason: "no_diff_detected" }));
-    }
     return { missingData: false, updated: updatedCount, unchanged: unchangedCount, unmatched: Math.max(0, unmatched.length - 3), aborted: false, syncTime: new Date() };
   }
   
@@ -1555,14 +1897,6 @@ function runLmsSync() {
       rowsToWrite.push({ row: sheetRow, values: nextTrackerData[i].slice(), bg: safeBg });
     }
   }
-
-  if (DEBUG_LOGS) {
-    console.log("=== WRITE DEBUG (LMS) ===");
-    console.log("rowsToWrite:", rowsToWrite.length);
-    console.log("forceWriteRows:", forceWriteRows.size);
-    console.log("processedRows:", processedRows);
-    console.log("nextTracker length:", nextTrackerData.length);
-  }
   
   while (bgColors.length < nextTrackerData.length - 1) bgColors.push(new Array(headers.length).fill("#ffffff"));
   
@@ -1570,13 +1904,20 @@ function runLmsSync() {
   
   if (rowsToWrite.length > 0) {
     executeSecureWrite("LMS_WRITE", () => {
-      writeRowsInBatches(trackerSheet, rowsToWrite, headerMap);
+      writeRowsInBatches(trackerSheet, rowsToWrite, headerMap, manualColIndexes);
       const progColIdx = headerMap[H.LMS_PROG];
       if (progColIdx !== undefined && trackerData.length > 1) trackerSheet.getRange(2, progColIdx + 1, trackerData.length - 1, 1).setNumberFormat("0.00%");
     });
   }
   
-  if (unmatched.length > 3) {
+  const MAX_UNMATCHED_RECORDS = 500;
+  let unmatchedToWrite = unmatched;
+  
+  if (unmatchedToWrite.length > MAX_UNMATCHED_RECORDS + 3) {
+      unmatchedToWrite = unmatchedToWrite.slice(0, MAX_UNMATCHED_RECORDS + 3);
+  }
+
+  if (unmatchedToWrite.length > 3) {
     let unSheet = getOrCreateSheet(CONFIG.SHEETS.UNMATCHED);
     let lastRow = unSheet.getLastRow(); let lastCol = unSheet.getLastColumn();
     let manualDataMap = {}; let manualHeaders = [];
@@ -1589,26 +1930,25 @@ function runLmsSync() {
       }
     }
 
-    for (let i = 3; i < unmatched.length; i++) {
-      let emailKey = (unmatched[i][0] || "").toString().trim().toLowerCase();
+    for (let i = 3; i < unmatchedToWrite.length; i++) {
+      let emailKey = (unmatchedToWrite[i][0] || "").toString().trim().toLowerCase();
       let manualCols = manualDataMap[emailKey] || new Array(manualHeaders.length).fill("");
-      unmatched[i] = unmatched[i].concat(manualCols);
+      unmatchedToWrite[i] = unmatchedToWrite[i].concat(manualCols);
     }
-    unmatched[2] = unmatched[2].concat(manualHeaders); unmatched[0] = unmatched[0].concat(new Array(manualHeaders.length).fill("")); unmatched[1] = unmatched[1].concat(new Array(manualHeaders.length).fill(""));
+    unmatchedToWrite[2] = unmatchedToWrite[2].concat(manualHeaders); unmatchedToWrite[0] = unmatchedToWrite[0].concat(new Array(manualHeaders.length).fill("")); unmatchedToWrite[1] = unmatchedToWrite[1].concat(new Array(manualHeaders.length).fill(""));
 
-    unSheet.clearContents(); unSheet.getRange(1, 1, unmatched.length, unmatched[0].length).setValues(unmatched);
+    unSheet.getRange(1, 1, unmatchedToWrite.length, unmatchedToWrite[0].length).clearContent();
+    unSheet.getRange(1, 1, unmatchedToWrite.length, unmatchedToWrite[0].length).setValues(unmatchedToWrite);
     unSheet.getRange("A3:B3").setFontWeight("bold").setBackground("#f3f3f3");
     if (manualHeaders.length > 0) unSheet.getRange(3, 3, 1, manualHeaders.length).setFontWeight("bold").setBackground("#f3f3f3");
     unSheet.setColumnWidth(1, 250); unSheet.setColumnWidth(2, 200);
-    showProgress(ss, `⚠️ ${unmatched.length - 3} LMS records unmatched. Check 'LMS Unmatched' tab.`, "LMS Warning", 8);
-  } else {
-    showProgress(ss, `✅ LMS Sync Complete. Updated ${updatedCount} students.`, "Done", 5);
   }
-  return { missingData: false, updated: updatedCount, unchanged: unchangedCount, unmatched: Math.max(0, unmatched.length - 3), aborted: false, syncTime: new Date() };
+  return { missingData: false, updated: updatedCount, unchanged: unchangedCount, unmatched: Math.max(0, unmatchedToWrite.length - 3), aborted: false, syncTime: new Date() };
 }
 
 // ================= GITHUB =================
 function updateGithubActivity() {
+  verifySyncContext();
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = getOrCreateSheet(CONFIG.SHEETS.TRACKER);
   const data = getSheetDataWithFormulas(sheet);
@@ -1616,7 +1956,7 @@ function updateGithubActivity() {
   
   const headers = data[0];
   const headersNorm = headers.map(normHeader);
-  const headerMap = buildHeaderMap(headersNorm, true);
+  const headerMap = getHeaderMap(CONFIG.SHEETS.TRACKER, headersNorm, true);
   
   let bgColors = [];
   if (sheet.getLastRow() > 1 && sheet.getLastColumn() > 0) bgColors = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getBackgrounds();
@@ -1632,19 +1972,27 @@ function updateGithubActivity() {
   let cacheStr = props.getProperty("GITHUB_CACHE") || "{}"; let cache; try { cache = JSON.parse(cacheStr); } catch(e) { cache = {}; }
   let actCacheStr = props.getProperty("GITHUB_ACT_CACHE") || "{}"; let actCache; try { actCache = JSON.parse(actCacheStr); } catch(e) { actCache = {}; }
   
-  const SEVEN_DAYS = 7 * 24 * 60 * 60 * 1000; const TWELVE_HOURS = 12 * 60 * 60 * 1000; const now = Date.now();
-  let searchCount = 0, newFoundCount = 0, updatedCount = 0, unchangedCount = 0; const MAX_SEARCHES_PER_RUN = 30; 
+  enforceCacheLimit(cache, MAX_CACHE_SIZE);
+  enforceCacheLimit(actCache, MAX_CACHE_SIZE);
+  
+  const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1000; const TWELVE_HOURS = 12 * 60 * 60 * 1000; const now = Date.now();
+  let searchCount = 0, newFoundCount = 0, updatedCount = 0, unchangedCount = 0; const MAX_SEARCHES_PER_RUN = 10; 
   
   let anyChange = false;
   let processedRows = 0;
   const forceWriteRows = new Set();
   const nextData = data.map(r => r.slice());
+  
+  const manualColIndexes = [];
+  COLUMN_OWNERS.MANUAL.forEach(field => {
+      const idx = headerMap[field];
+      if (idx !== undefined) manualColIndexes.push(idx);
+  });
 
   for (let i = 1; i < nextData.length; i++) {
     shouldStop();
     
-    // Manual Fields 
-    const trackerStudent = createRowModel(nextData[i], headerMap, COLUMN_OWNERS.MANUAL);
+    const trackerStudent = createRowModel(nextData[i], headerMap);
     const emailStr = normEmail(trackerStudent.get(H.EMAIL));
     const idStr = normId(trackerStudent.get(H.ID));
     
@@ -1652,20 +2000,26 @@ function updateGithubActivity() {
     processedRows++;
     
     const origRowCopy = nextData[i].slice();
+    const origHash = fastHash(origRowCopy);
+
     let currentUname = trackerStudent.get(H.GH_UNAME);
     let cacheKey = idStr || emailStr;
     let cData = cache[cacheKey];
     let cVal = null, cTs = 0;
     
-    if (cData && typeof cData === "object") { cVal = cData.val; cTs = cData.ts || 0; } 
-    else if (cData) { cVal = cData; cTs = now; cache[cacheKey] = { val: cVal, ts: cTs }; }
+    if (cData && typeof cData === "object" && cData.ts) { 
+        cVal = cData.val; cTs = cData.ts; 
+        cData.ts = now; 
+    } else if (cData) { 
+        cVal = cData?.val || cData; cTs = now; cache[cacheKey] = { val: cVal, ts: cTs }; 
+    }
     
     if (!currentUname && cVal && cVal !== "NOT_FOUND") {
-       if (isDifferent(trackerStudent.get(H.GH_UNAME), cVal)) trackerStudent.set(H.GH_UNAME, cVal);
+       trackerStudent.safeSet(H.GH_UNAME, cVal);
        currentUname = cVal;
     }
     
-    const isNotFoundExpired = (cVal === "NOT_FOUND") && (now - cTs > SEVEN_DAYS);
+    const isNotFoundExpired = (cVal === "NOT_FOUND") && (now - cTs > THIRTY_DAYS);
     if (!currentUname && (!cVal || isNotFoundExpired) && searchCount < MAX_SEARCHES_PER_RUN) { 
       searchCount++; let delay = 300;
       for (let attempt = 0; attempt < 3; attempt++) {
@@ -1674,48 +2028,72 @@ function updateGithubActivity() {
           if (res.getResponseCode() === 200) {
             const found = JSON.parse(res.getContentText()).items?.[0]?.author?.login;
             if (found) {
-              if (isDifferent(trackerStudent.get(H.GH_UNAME), found)) trackerStudent.set(H.GH_UNAME, found);
+              trackerStudent.safeSet(H.GH_UNAME, found);
               cache[cacheKey] = { val: found, ts: now }; newFoundCount++;
             } else { cache[cacheKey] = { val: "NOT_FOUND", ts: now }; }
             break;
-          } else if (res.getResponseCode() === 403 || res.getResponseCode() === 429) { Utilities.sleep(delay); delay *= 2; } else break;
+          } else if (res.getResponseCode() === 403 || res.getResponseCode() === 429) { 
+              const rHeaders = res.getHeaders();
+              const remaining = rHeaders['X-RateLimit-Remaining'] || rHeaders['x-ratelimit-remaining'];
+              const reset = rHeaders['X-RateLimit-Reset'] || rHeaders['x-ratelimit-reset'];
+              if (remaining === '0' && reset) {
+                  const waitTime = (parseInt(reset) * 1000) - Date.now();
+                  if (waitTime > 0 && waitTime < 60000) { Utilities.sleep(waitTime + 1000); } 
+                  else { throw new Error("GitHub API Rate limit exhausted. Try again later."); }
+              } else {
+                  Utilities.sleep(1000 + Math.random() * 1000);
+                  delay *= 2;
+              }
+          } else break;
         } catch(e) { Utilities.sleep(delay); delay *= 2; }
       }
     }
-    const rowActuallyChanged = fastHash(origRowCopy) !== fastHash(nextData[i]);
+    
+    if (nextData[i]) {
+      manualColIndexes.forEach(tIdx => {
+        nextData[i][tIdx] = data[i][tIdx];
+      });
+    }
+
+    const newHash = fastHash(nextData[i]);
+    const rowActuallyChanged = origHash !== newHash;
     if (rowActuallyChanged) { anyChange = true; forceWriteRows.add(i); }
-  }
-  
-  const currentCacheSize = Object.keys(cache).length;
-  if (currentCacheSize > MAX_CACHE_SIZE) {
-     const overflow = currentCacheSize - MAX_CACHE_SIZE + 50;
-     const keysToRemove = Object.entries(cache).sort((a,b) => a[1].ts - b[1].ts).slice(0, overflow).map(e => e[0]);
-     keysToRemove.forEach(k => delete cache[k]);
   }
   
   let requests = [], map = [];
   for (let i = 1; i < nextData.length; i++) {
-    const trackerStudent = createRowModel(nextData[i], headerMap, COLUMN_OWNERS.MANUAL);
+    const trackerStudent = createRowModel(nextData[i], headerMap);
     let uname = trackerStudent.get(H.GH_UNAME);
     const origRowCopy = nextData[i].slice();
+    const origHash = fastHash(origRowCopy);
     
     if (uname && uname.toString().trim() !== "") {
       uname = uname.toString().toLowerCase().replace(/^https?:\/\/github\.com\//, "").split(/[/?#]/)[0].replace("@", "").trim();
-      if (isDifferent(trackerStudent.get(H.GH_UNAME), uname)) trackerStudent.set(H.GH_UNAME, uname);
+      trackerStudent.safeSet(H.GH_UNAME, uname);
       
       let aData = actCache[uname];
-      if (aData && typeof aData === "object" && (now - aData.ts < TWELVE_HOURS)) {
+      if (aData && typeof aData === "object" && aData.ts && (now - aData.ts < TWELVE_HOURS)) {
         let actVal = aData.val;
         if (actVal !== "No recent activity (90d)" && actVal !== "User Not Found") actVal = new Date(actVal);
-        if (isDifferent(trackerStudent.get(H.GH_ACT), actVal)) trackerStudent.set(H.GH_ACT, actVal);
+        trackerStudent.safeSet(H.GH_ACT, actVal);
         const newLink = `=HYPERLINK("https://github.com/${uname}", "${uname}")`;
-        if (isDifferent(trackerStudent.get(H.GH_PROF), newLink)) trackerStudent.set(H.GH_PROF, newLink);
+        trackerStudent.safeSet(H.GH_PROF, newLink);
+        aData.ts = now; 
       } else {
         requests.push({ url: `https://api.github.com/users/${uname}/events/public?per_page=1`, headers: apiHeaders, muteHttpExceptions: true });
         map.push({ rowIdx: i, uname: uname });
       }
     }
-    const rowActuallyChanged = fastHash(origRowCopy) !== fastHash(nextData[i]);
+    
+    if (nextData[i]) {
+      manualColIndexes.forEach(tIdx => {
+        nextData[i][tIdx] = data[i][tIdx];
+      });
+    }
+
+    const newHash = fastHash(nextData[i]);
+    const rowActuallyChanged = origHash !== newHash;
+    
     if (rowActuallyChanged) { updatedCount++; anyChange = true; forceWriteRows.add(i); logDiff(origRowCopy, nextData[i], headerMap, uname || "Unknown"); } 
     else unchangedCount++;
   }
@@ -1731,33 +2109,41 @@ function updateGithubActivity() {
         const responses = UrlFetchApp.fetchAll(chunkReqs);
         responses.forEach((res, idx) => {
           const rIdx = chunkMap[idx].rowIdx; const uname = chunkMap[idx].uname; const code = res.getResponseCode();
-          const origRowCopy = nextData[rIdx].slice(); const trackerStudent = createRowModel(nextData[rIdx], headerMap, COLUMN_OWNERS.MANUAL);
+          const origRowCopy = nextData[rIdx].slice(); 
+          const origHash = fastHash(origRowCopy);
+          const trackerStudent = createRowModel(nextData[rIdx], headerMap);
           if (code === 200) {
             try {
               const events = JSON.parse(res.getContentText());
               let valToCache = "No recent activity (90d)";
               if (events.length > 0) { 
                 const newVal = new Date(events[0].created_at); valToCache = events[0].created_at;
-                if (isDifferent(trackerStudent.get(H.GH_ACT), newVal)) trackerStudent.set(H.GH_ACT, newVal);
-              } else { if (isDifferent(trackerStudent.get(H.GH_ACT), valToCache)) trackerStudent.set(H.GH_ACT, valToCache); }
+                trackerStudent.safeSet(H.GH_ACT, newVal);
+              } else { trackerStudent.safeSet(H.GH_ACT, valToCache); }
               const newFormula = `=HYPERLINK("https://github.com/${uname}", "${uname}")`;
-              if (isDifferent(trackerStudent.get(H.GH_PROF), newFormula)) trackerStudent.set(H.GH_PROF, newFormula);
+              trackerStudent.safeSet(H.GH_PROF, newFormula);
               actCache[uname] = { val: valToCache, ts: now };
             } catch(e) {}
           } else if (code === 404) {
-             if (isDifferent(trackerStudent.get(H.GH_ACT), "User Not Found")) trackerStudent.set(H.GH_ACT, "User Not Found");
+             trackerStudent.safeSet(H.GH_ACT, "User Not Found");
              actCache[uname] = { val: "User Not Found", ts: now };
           }
-          const rowActuallyChanged = fastHash(origRowCopy) !== fastHash(nextData[rIdx]);
+          
+          if (nextData[rIdx]) {
+            manualColIndexes.forEach(tIdx => {
+              nextData[rIdx][tIdx] = data[rIdx][tIdx];
+            });
+          }
+
+          const newHash = fastHash(nextData[rIdx]);
+          const rowActuallyChanged = origHash !== newHash;
+          
           if (rowActuallyChanged) { updatedCount++; unchangedCount--; anyChange = true; forceWriteRows.add(rIdx); }
         });
-      } catch (e) { if (e.message.includes("Bandwidth") || e.message.includes("quota")) quotaExceeded = true; }
-    }
-    const currentActSize = Object.keys(actCache).length;
-    if (currentActSize > MAX_CACHE_SIZE) {
-       const overflow = currentActSize - MAX_CACHE_SIZE + 50;
-       const keysToRemove = Object.entries(actCache).sort((a,b) => a[1].ts - b[1].ts).slice(0, overflow).map(e => e[0]);
-       keysToRemove.forEach(k => delete actCache[k]);
+      } catch (e) { 
+          if (e.message.includes("Bandwidth") || e.message.includes("quota")) quotaExceeded = true; 
+          Utilities.sleep(1000 + Math.random() * 1000);
+      }
     }
   }
   
@@ -1766,10 +2152,6 @@ function updateGithubActivity() {
   }
   
   if (!anyChange && forceWriteRows.size === 0 && processedRows > 0) {
-    if (DEBUG_LOGS) {
-      console.log("✅ No changes detected in GitHub Sync. (Normal if re-running identical data)");
-      console.log(JSON.stringify({ module: "GITHUB_SYNC", processedRows, forceWriteRows: forceWriteRows.size, reason: "no_diff_detected" }));
-    }
     return { newFoundCount: newFoundCount, updated: updatedCount, unchanged: unchangedCount, aborted: false, syncTime: new Date() };
   }
   
@@ -1781,14 +2163,6 @@ function updateGithubActivity() {
       rowsToWrite.push({ row: sheetRow, values: nextData[i].slice(), bg: safeBg }); 
     }
   }
-
-  if (DEBUG_LOGS) {
-    console.log("=== WRITE DEBUG (GITHUB) ===");
-    console.log("rowsToWrite:", rowsToWrite.length);
-    console.log("forceWriteRows:", forceWriteRows.size);
-    console.log("processedRows:", processedRows);
-    console.log("nextTracker length:", nextData.length);
-  }
   
   while (bgColors.length < nextData.length - 1) bgColors.push(new Array(headers.length).fill("#ffffff"));
   
@@ -1796,9 +2170,12 @@ function updateGithubActivity() {
   
   if (rowsToWrite.length > 0) {
     executeSecureWrite("GITHUB_WRITE", () => {
-      writeRowsInBatches(sheet, rowsToWrite, headerMap);
+      writeRowsInBatches(sheet, rowsToWrite, headerMap, manualColIndexes);
     });
   }
+  
+  enforceCacheLimit(cache, MAX_CACHE_SIZE);
+  enforceCacheLimit(actCache, MAX_CACHE_SIZE);
   
   props.setProperty("GITHUB_CACHE", JSON.stringify(cache));
   props.setProperty("GITHUB_ACT_CACHE", JSON.stringify(actCache));
@@ -1825,6 +2202,10 @@ function updateDashboard(crm, sync, lms, github, redCount) {
   delete ex["Students Removed (Not in CRM)"];
   delete ex["Students Purged (No ID)"];
   delete ex["Students Skipped (No ID & No Email)"];
+  delete ex["Ambiguous Dates Defaulted to UK"];
+  delete ex["Ambiguous Dates Defaulted to US"];
+  delete ex["Unknown Headers Ignored"];
+  delete ex["Header Alias Collisions Resolved"];
   
   if (crm) { ex["CRM File Generation Date (from CSV)"] = crm.generatedDate; ex["CRM Source File"] = crm.fileName; }
   if (sync) { 
@@ -1859,6 +2240,10 @@ function updateDashboard(crm, sync, lms, github, redCount) {
   if (lastRow > 1) {
     dash.getRange(2, 1, lastRow, 2).clearContent();
   }
+  
+  if (globalUnknownHeaders > 0) outData.push(["Unknown Headers Ignored", globalUnknownHeaders]);
+  if (globalAliasCollisions > 0) outData.push(["Header Alias Collisions Resolved", globalAliasCollisions]);
+  // Removed the ambiguous dates push here
   
   if (outData.length > 0) {
     dash.getRange(2, 1, outData.length, 2).setValues(outData);
