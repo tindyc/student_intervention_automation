@@ -37,7 +37,7 @@ A fault-tolerant, fully automated data pipeline built in Google Apps Script that
 
 ## 💼 Business Problem
 
-Educational support teams often rely on fragmented systems:
+Facilitation teams often rely on fragmented systems:
 - Zoho CRM (student records)
 - Cypher LMS (learning activity)
 - GitHub (technical progress)
