@@ -242,6 +242,60 @@ Outputs:
 
 ---
 
+## 🛠️ Built-In Tools & Controls (Menu Features)
+
+The tracker includes a custom Google Sheets menu to manage the system without touching code.
+
+### 📊 Sync Controls
+
+- **▶️ Run Full Sync**  
+  Runs the full pipeline (CRM + LMS + GitHub + Risk Engine)
+
+- **🔄 Sync CRM Only**  
+  Updates student records from CRM  
+
+- **🎓 Sync LMS Only**  
+  Updates learning activity and progress  
+
+- **🐙 GitHub Sync Only**  
+  Refreshes GitHub activity data  
+
+---
+
+### ⚙️ Configuration & Setup
+
+- **🧪 Run Setup Check**  
+  Verifies system configuration before syncing  
+
+- **⚙️ Change CRM Report Name**  
+  Updates the CRM file identifier used for Gmail search  
+
+---
+
+### 🛡️ Recovery & Safety Tools
+
+- **🔓 Clear Crash Lock**  
+  Unlocks the system after a failed or interrupted sync  
+  (Prevents running on partially written data)
+
+- **🔓 Allow Duplicate CRM File**  
+  Allows reprocessing the same CRM file if needed  
+  (Normally blocked to prevent unnecessary re-syncs)
+
+- **🧹 Reset GitHub API Cache**  
+  Clears cached GitHub data to force fresh API calls  
+
+---
+
+### 💡 Why This Matters
+
+These controls allow non-technical users to:
+- Recover safely from errors  
+- Avoid duplicate processing  
+- Maintain system integrity without editing code  
+
+This turns the script into a usable internal tool rather than just a backend process.
+
 ## 📊 Impact
 
 | Before | After |
