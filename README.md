@@ -1,6 +1,6 @@
 # 📊 Student Intervention Automation
 
-A fault-tolerant, fully automated data pipeline built in Google Apps Script that consolidates student data from Zoho CRM, Cypher LMS, and GitHub into a unified tracking system with a real-time risk evaluation engine.
+A fault-tolerant, fully automated data pipeline built in Google Apps Script that consolidates student data from Zoho CRM, Cypher LMS, and GitHub into a unified tracking system with a real-time risk evaluation engine. This allows teams to identify at-risk students quickly with  just one CLICK!
 
 ---
 
