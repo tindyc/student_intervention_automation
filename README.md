@@ -1,4 +1,4 @@
-# 📊 Student Intervention Tracker & Sync Automator
+# 📊 Student Intervention Automation
 
 A fault-tolerant, fully automated data pipeline built in Google Apps Script that consolidates student data from Zoho CRM, Cypher LMS, and GitHub into a unified tracking system with a real-time risk evaluation engine.
 
@@ -58,7 +58,7 @@ Instead of:
 - Downloading and merging CSV files  
 - Manually checking each student’s activity  
 
-Everything is now handled in **one click**.
+Everything is now handled in just  **one click** !!!
 
 With a single sync:
 1. CRM data is pulled automatically from Gmail  
@@ -356,4 +356,4 @@ This turns the script into a usable internal tool rather than just a backend pro
 
 A production-style data pipeline built within a constrained environment, focused on data integrity, reliability, and automation.
 
-Designed to replace manual workflows with a safe, scalable system for real-time student intervention.
+Designed to replace manual workflows with a safe, scalable system for real-time student tracking and intervention.
