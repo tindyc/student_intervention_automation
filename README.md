@@ -51,13 +51,27 @@ This leads to:
 
 ## 🚀 Solution
 
-This system automates the entire workflow into a single pipeline:
+This system replaces a fragmented, manual workflow with a single automated process.
 
-1. Fetch CRM data from Gmail  
-2. Sync and reconcile student records  
-3. Enrich with LMS + GitHub data  
-4. Apply Risk Engine  
-5. Output dashboard + audit logs  
+Instead of:
+- Logging into multiple platforms  
+- Downloading and merging CSV files  
+- Manually checking each student’s activity  
+
+Everything is now handled in **one click**.
+
+With a single sync:
+1. CRM data is pulled automatically from Gmail  
+2. LMS activity is merged into each student record  
+3. GitHub activity is updated  
+4. Risk levels are calculated instantly  
+
+The result:
+- A fully updated tracker  
+- Clear visibility of every student  
+- Automatic identification of at-risk students  
+
+All in one place, with no manual cross-checking required.
 
 ---
 
@@ -295,6 +309,8 @@ These controls allow non-technical users to:
 - Maintain system integrity without editing code  
 
 This turns the script into a usable internal tool rather than just a backend process.
+
+---
 
 ## 📊 Impact
 
