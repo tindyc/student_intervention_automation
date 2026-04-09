@@ -63,77 +63,169 @@ This system automates the entire workflow into a single pipeline:
 
 ## 🧠 Architecture Overview
 
-This project is designed as an **idempotent, multi-stage data pipeline**:
+This project is structured as a multi-step data pipeline:
 
 - **Ingestion:** Gmail → CRM CSV  
-- **Transformation:** schema + alias resolution  
-- **Sync Engine:** deterministic add/update/delete  
-- **Enrichment:** LMS + GitHub  
+- **Transformation:** Clean and standardise data  
+- **Sync Engine:** Add, update, and remove students  
+- **Enrichment:** LMS + GitHub data  
 - **Analytics:** Risk Engine  
-- **Output:** dashboard + logs  
+- **Output:** Tracker + Dashboard + Logs  
 
 ### Design Principles
-- Idempotent execution (safe re-runs)  
-- Deterministic diffing (hash-based)  
-- Fail-fast validation  
-- Modular processing stages  
+- Safe to run multiple times  
+- Only update what has changed  
+- Stop on errors instead of guessing  
+- Keep each stage independent  
 
 ---
 
-## 🛡️ Data Integrity & Reliability
+## 🔬 How the Data Sync Works
 
-Built in Safeguards:
-
-- **Deterministic Row Hashing**
-  - Only writes rows that actually changed  
-
-- **Transaction-Safe Writes**
-  - Prevents partial updates  
-
-- **Crash Recovery Lock**
-  - Blocks unsafe re-runs after failure  
-
-- **Mass Deletion Protection**
-  - Detects abnormal removals and stops execution  
-
-- **Schema Drift Detection**
-  - Flags missing or renamed columns  
-
-- **Identity Conflict Protection**
-  - Prevents merging incorrect student records  
-
-- **Manual Column Protection**
-  - Preserves user-entered notes  
-
-- **Stale Data Rejection**
-  - Blocks CRM files older than 7 days  
+This system safely combines data from multiple sources while making sure nothing is duplicated, overwritten incorrectly, or lost.
 
 ---
 
-## ⚡ Performance Optimisations
+### 🧱 How Students Are Matched
 
-- Batch write operations  
-- Row-level diffing (hashing)  
-- LRU caching (dates + API calls)  
-- Runtime guard (4.5 min cutoff)  
-- GitHub API rate-limit handling  
+Each student is identified using:
+
+- **Record Id** (main identifier from CRM)  
+- **Email** (used only if ID is missing)  
+
+How it works:
+- Match using Record Id first  
+- If missing, fallback to Email  
+- If both exist but don’t match, stop the sync  
+
+This prevents mixing up different students.
 
 ---
 
-## 🚦 Risk Engine
+### 🔁 Safe Syncing
 
-Automatically evaluates student risk based on:
+You can run the sync as many times as needed.
 
+Each run:
+- Updates existing students  
+- Adds new students  
+- Removes students no longer in CRM  
+
+The result is always a clean and up-to-date tracker.
+
+---
+
+### 🔍 How Changes Are Detected
+
+Before updating, each row is compared with existing data.
+
+- No change → skip  
+- Change → update  
+
+This keeps performance high and avoids unnecessary writes.
+
+---
+
+### 🧬 Handling Different Data Formats
+
+CRM and LMS exports are not always consistent.
+
+The system:
+- Matches similar column names automatically  
+- Cleans values before comparing  
+- Ignores unknown fields safely  
+
+If a critical field is missing, the sync stops.
+
+---
+
+### 🔗 Combining Multiple Data Sources
+
+Data is merged into one row per student.
+
+Matching order:
+1. Record Id  
+2. Email  
+
+Handled cases:
+- Missing data  
+- Duplicate records  
+- Mismatched entries  
+
+If unsure, the system stops instead of guessing.
+
+---
+
+### 🧾 Safe Write Process
+
+All updates are prepared before writing.
+
+Steps:
+1. Build updated data in memory  
+2. Group changes into batches  
+3. Write in controlled operations  
+
+This ensures:
+- No partial updates  
+- No broken sheets  
+- No inconsistent data  
+
+---
+
+### 🚨 Data Safety Checks
+
+#### Prevents Large Accidental Deletions
+
+If too many students are about to be removed:
+- The sync stops  
+- Manual confirmation is required  
+
+---
+
+#### Prevents Student Mix-Ups
+
+If:
+- Same Email  
+- Different Record Id  
+
+The sync stops immediately.
+
+---
+
+#### Prevents Outdated Data
+
+If CRM data is older than 7 days:
+- Sync is blocked  
+
+---
+
+## 🧠 Risk Engine
+
+Automatically identifies students who may need support.
+
+Checks:
 - Missed deadlines  
 - Resubmission windows  
 - LMS inactivity  
 
-### Outputs
-- Colour-coded risk levels  
-- Auto-generated reasons:
-  - "Deadline missed"  
-  - "Resub overdue"  
-  - "LMS inactive 7/14/30+ days "  
+Examples:
+- Deadline passed → "Deadline missed"  
+- Resub overdue → "Resub overdue"  
+- No activity → "LMS inactive 7/14/30+ days"  
+
+Outputs:
+- Colour-coded rows  
+- Clear reasons for risk  
+
+---
+
+## ⚡ Performance Optimisation
+
+- Only changed rows are updated  
+- Data processed in memory  
+- Batch writes reduce API calls  
+- Caching reduces repeated work  
+- Script stops early to avoid timeout  
 
 ---
 
@@ -163,19 +255,19 @@ Automatically evaluates student risk based on:
 
 ## 🧩 Technical Highlights
 
-- Multi-source data integration (CRM, LMS, REST API)  
-- Idempotent sync architecture  
-- Deterministic diffing system  
-- Transaction-safe write engine  
-- Schema validation + enforcement  
-- Rule-based analytics engine  
-- Performance optimisation under runtime constraints  
+- Multi-source data integration  
+- Safe re-runnable sync logic  
+- Row-level change detection  
+- Controlled write operations  
+- Schema validation  
+- Rule-based risk evaluation  
+- Performance optimisation under runtime limits  
 
 ---
 
 ## ⚖️ Tradeoffs
 
-- GitHub API rate limits (handled via caching)  
+- GitHub API rate limits (handled with caching)  
 - Apps Script runtime limit (~6 minutes)  
 - LMS matching depends on consistent identifiers  
 
@@ -183,15 +275,15 @@ Automatically evaluates student risk based on:
 
 ## 🛠️ Tech Stack
 
-- Google Apps Script (JavaScript runtime)  
-- Google Sheets (data store + UI)  
-- Gmail API (data ingestion)  
-- GitHub REST API (activity tracking)  
+- Google Apps Script (JavaScript)  
+- Google Sheets  
+- Gmail API  
+- GitHub API  
 
 ---
 
 ## 📌 Summary
 
-A production-style data pipeline built within a constrained environment, with strong emphasis on data integrity, fault tolerance, and automation.
+A production-style data pipeline built within a constrained environment, focused on data integrity, reliability, and automation.
 
-Designed to replace manual workflows with a reliable, scalable system for real-time student intervention.
+Designed to replace manual workflows with a safe, scalable system for real-time student intervention.
