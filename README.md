@@ -75,6 +75,17 @@ All in one place, with no manual cross-checking required.
 
 ---
 
+## 📊 Impact
+
+| Before | After |
+|------|--------|
+| Manual data aggregation | Fully automated pipeline |
+| Multiple systems | Single dashboard |
+| Reactive support | Proactive intervention |
+| Hours of admin work | One-click sync |
+
+---
+
 ## 🧠 Architecture Overview
 
 This project is structured as a multi-step data pipeline:
@@ -374,17 +385,6 @@ This feature improves:
 
 It allows developers to understand system behaviour without stepping
 through the entire script.
-
----
-
-## 📊 Impact
-
-| Before | After |
-|------|--------|
-| Manual data aggregation | Fully automated pipeline |
-| Multiple systems | Single dashboard |
-| Reactive support | Proactive intervention |
-| Hours of admin work | One-click sync |
 
 ---
 
