@@ -311,6 +311,71 @@ These controls allow non-technical users to:
 This turns the script into a usable internal tool rather than just a backend process.
 
 ---
+## 🐞 Debug Mode
+
+The system includes a configurable debug mode to support development,
+testing, and issue investigation.
+
+------------------------------------------------------------------------
+
+### 🔧 Configuration
+
+Debug behaviour is controlled using simple flags in the script:
+
+``` js
+const DEBUG_LOGS = true;
+const VERBOSE_LOGS = false;
+```
+
+-   DEBUG_LOGS enables high-level execution logs
+-   VERBOSE_LOGS enables more detailed logs, including payloads and
+    batch operations
+
+------------------------------------------------------------------------
+
+### 📊 Logged Information
+
+When enabled, debug mode provides visibility into:
+
+-   Sync stages (CRM, LMS, GitHub, Risk Engine)
+-   Number of records processed, added, updated, and removed
+-   Record matching decisions (Record Id vs Email fallback)
+-   Detected changes during row comparison
+-   API interactions and responses when verbose mode is enabled
+
+------------------------------------------------------------------------
+
+### 🔍 Use Cases
+
+Debug mode helps with:
+
+-   Tracing how individual student records are processed
+-   Investigating missing or mismatched data
+-   Validating change detection logic
+-   Monitoring behaviour during large sync runs
+
+------------------------------------------------------------------------
+
+### ⚙️ Usage Notes
+
+-   Debug mode is disabled during normal operation
+-   Verbose logging should be used selectively due to larger output
+-   Logs are structured for easier inspection in Apps Script logs
+
+------------------------------------------------------------------------
+
+### 💡 Purpose
+
+This feature improves:
+
+-   Troubleshooting without modifying core logic
+-   Confidence during development and testing
+-   Maintainability for future contributors
+
+It allows developers to understand system behaviour without stepping
+through the entire script.
+
+---
 
 ## 📊 Impact
 
